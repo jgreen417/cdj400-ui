@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""cdj400-sort — put the tracks in a lean stick's playlist folders in BPM, key or
+name order, using Rekordbox's own analysis.
+
+Usage:
+  cdj400-sort <usb> --by bpm|key|name [--folder NAME ...]            # dry run
+  cdj400-sort <usb> --by bpm|key|name [--folder NAME ...] --execute  # sort
+
+No --folder means every folder in Playlists/.
+
+  bpm   slowest first; ties by key, then name
+  key   Camelot wheel order (1A, 1B, 2A ...), slowest first within a key
+  name  alphabetical, and removes the number prefixes the other orders add
+
+The order the CDJ-400 lists files in is either by filename or by the order
+they were written, so this does both: bpm/key prefix each file "001 - " and
+the folder is rebuilt by moving files into a fresh folder in that order (a
+rename on the same stick, so it is instant and copies nothing).
+<folder>/.cdj400-order.json remembers each file's original name and the
+order, so cdj400-addplaylist can still match tracks and re-sort after adding.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unicodedata
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent  # sibling cdj400-* tools live here
+DBEXPORT = HERE / "cdj400-dbexport"
+SCRATCH = Path(tempfile.gettempdir()) / "cdj400"
+ORDER_FILE = ".cdj400-order.json"
+
+CAMELOT = {
+    "Abm": "1A", "G#m": "1A", "Ebm": "2A", "D#m": "2A", "Bbm": "3A", "A#m": "3A",
+    "Fm": "4A", "Cm": "5A", "Gm": "6A", "Dm": "7A", "Am": "8A", "Em": "9A",
+    "Bm": "10A", "F#m": "11A", "Gbm": "11A", "Dbm": "12A", "C#m": "12A",
+    "B": "1B", "Cb": "1B", "F#": "2B", "Gb": "2B", "Db": "3B", "C#": "3B",
+    "Ab": "4B", "G#": "4B", "Eb": "5B", "D#": "5B", "Bb": "6B", "A#": "6B",
+    "F": "7B", "C": "8B", "G": "9B", "D": "10B", "A": "11B", "E": "12B",
+}
+
+
+def norm(name: str) -> str:
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def fat32_safe(name: str) -> str:
+    name = "".join(c for c in name if c not in '<>:"/\\|?*').strip().rstrip(".")
+    return name[:100] or "untitled"
+
+
+def url_to_path(url: str) -> Path | None:
+    if not url.startswith("file://"):
+        return None
+    return Path(urllib.request.url2pathname(urllib.parse.urlparse(url).path))
+
+
+def load_analysis(xml: Path) -> dict[str, list[tuple[int, float, str]]]:
+    """norm(file name) -> [(size, bpm, key)], under both the Mac name and its FAT-safe form."""
+    index: dict[str, list[tuple[int, float, str]]] = {}
+    for tr in ET.parse(xml).getroot().find("COLLECTION"):
+        p = url_to_path(tr.get("Location", ""))
+        if p is None:
+            continue
+        entry = (int(tr.get("Size") or 0), float(tr.get("AverageBpm") or 0), tr.get("Tonality") or "")
+        for n in {norm(p.name), norm(fat32_safe(p.name))}:
+            index.setdefault(n, []).append(entry)
+    return index
+
+
+def read_order(folder: Path) -> dict:
+    try:
+        return json.loads((folder / ORDER_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def camelot_rank(key: str) -> tuple[int, int]:
+    code = CAMELOT.get(key)
+    if code is None:
+        return (99, 9)
+    return (int(code[:-1]), 0 if code.endswith("A") else 1)
+
+
+def sort_folder(folder: Path, by: str, index, execute: bool) -> None:
+    rename_back = read_order(folder).get("original", {})
+    tracks = []
+    for p in folder.iterdir():
+        if not p.is_file() or p.name.startswith(".") or p.suffix.lower() != ".mp3":
+            continue
+        original = rename_back.get(p.name) or p.name
+        size = p.stat().st_size
+        matches = index.get(norm(original), [])
+        bpm, key = next(((b, k) for s, b, k in matches if s == size),
+                        (matches[0][1], matches[0][2]) if matches else (0.0, ""))
+        tracks.append(dict(path=p, original=original, bpm=bpm, key=key))
+
+    def name_rank(t):
+        return norm(t["original"])
+
+    if by == "bpm":
+        tracks.sort(key=lambda t: (t["bpm"] <= 0, t["bpm"], camelot_rank(t["key"]), name_rank(t)))
+    elif by == "key":
+        tracks.sort(key=lambda t: (camelot_rank(t["key"]), t["bpm"] <= 0, t["bpm"], name_rank(t)))
+    else:
+        tracks.sort(key=name_rank)
+
+    for i, t in enumerate(tracks, 1):
+        t["new"] = t["original"] if by == "name" else f"{i:03d} - {t['original']}"
+
+    unknown = sum(1 for t in tracks if t["bpm"] <= 0 and not t["key"])
+    print(f"{folder.name}: {len(tracks)} tracks by {by}"
+          + (f" ({unknown} without Rekordbox analysis, placed last)" if unknown and by != "name" else ""))
+    for t in tracks[:200]:
+        tag = f"{t['bpm']:6.1f}  {CAMELOT.get(t['key'], '--'):>3} {t['key'] or '?':<4}" if t["bpm"] or t["key"] else "     ?    ?    "
+        print(f"  {tag}  {t['new']}")
+    if not execute:
+        return
+
+    work = folder.parent / f".sorting-{folder.name}"
+    old = folder.parent / f".unsorted-{folder.name}"
+    for leftover in (work, old):
+        if leftover.exists():
+            sys.exit(f"{leftover} exists from an interrupted sort: move its files back into {folder} first")
+    work.mkdir()
+    for t in tracks:
+        os.rename(t["path"], work / t["new"])
+    for p in list(folder.iterdir()):
+        if p.name == ORDER_FILE or p.name.startswith("._"):
+            continue
+        os.rename(p, work / p.name)
+    if by == "name":
+        (work / ORDER_FILE).unlink(missing_ok=True)
+    else:
+        (work / ORDER_FILE).write_text(json.dumps({
+            "by": by,
+            "original": {t["new"]: t["original"] for t in tracks},
+        }, ensure_ascii=False, indent=1))
+    os.rename(folder, old)
+    os.rename(work, folder)
+    shutil.rmtree(old, ignore_errors=True)
+    for p in list(folder.glob("._*")) + list(folder.parent.glob("._*")):
+        p.unlink(missing_ok=True)        # macOS writes these on FAT when renaming
+    print(f"  sorted {folder.name} by {by}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("usb")
+    ap.add_argument("--by", choices=["bpm", "key", "name"], required=True)
+    ap.add_argument("--folder", action="append", default=[])
+    ap.add_argument("--execute", action="store_true")
+    ap.add_argument("--xml", help="use this dbexport XML instead of exporting the live library")
+    args = ap.parse_args()
+
+    pl_root = Path(args.usb) / "Playlists"
+    if not pl_root.is_dir():
+        sys.exit(f"no Playlists/ on {args.usb}")
+    folders = [pl_root / f for f in args.folder] if args.folder else sorted(
+        p for p in pl_root.iterdir() if p.is_dir() and not p.name.startswith("."))
+    for f in folders:
+        if not f.is_dir():
+            sys.exit(f"no folder {f}")
+
+    index = {}
+    if args.by != "name":
+        if args.xml:
+            xml = Path(args.xml)
+        else:
+            xml = SCRATCH / "sort-library.xml"
+            xml.parent.mkdir(parents=True, exist_ok=True)
+            r = subprocess.run([str(DBEXPORT), "-o", str(xml)], capture_output=True, text=True)
+            if r.returncode != 0:
+                sys.exit(f"cdj400-dbexport failed:\n{r.stdout}{r.stderr}")
+        index = load_analysis(xml)
+
+    for f in folders:
+        sort_folder(f, args.by, index, args.execute)
+    if not args.execute:
+        print("\ndry run only — pass --execute to sort")
+
+
+if __name__ == "__main__":
+    main()

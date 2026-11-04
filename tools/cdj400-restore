@@ -1,0 +1,72 @@
+#!/bin/bash
+# cdj400-restore — undo a lean strip: copy PIONEER/ + Contents/ back onto a stick
+# from its newest backup in ~/Music/DJ.CDJ400-BACKUPS/.
+#
+# Usage: cdj400-restore /Volumes/MYSTICK [--consume]
+#   --consume   delete the backup afterwards (verified restore only). The backup
+#               exists solely to make this restore possible, so once the stick
+#               holds that data again it is redundant.
+set -eu
+USB="${1:?usage: cdj400-restore <usb-mount> [--consume]}"
+CONSUME=0
+for arg in "$@"; do
+  if [ "$arg" = "--consume" ]; then CONSUME=1; fi
+done
+NAME="$(basename "$USB")"
+BACKUPS="$HOME/Music/DJ.CDJ400-BACKUPS"
+if [ ! -d "$USB" ]; then echo "not mounted: $USB"; exit 1; fi
+
+# Prefer the newest backup carrying a .complete marker — an interrupted backup
+# can leave a partial dir that would otherwise win on mtime alone.
+DIR=""
+FALLBACK=""
+while IFS= read -r cand; do
+  [ -d "$cand" ] || continue
+  if [ -f "$cand/.complete" ]; then DIR="$cand"; break; fi
+  if [ -z "$FALLBACK" ]; then FALLBACK="$cand"; fi
+done <<< "$(ls -dt "$BACKUPS/$NAME"-* 2>/dev/null || true)"
+if [ -z "$DIR" ]; then DIR="$FALLBACK"; fi
+
+if [ -z "$DIR" ] || [ ! -d "$DIR" ]; then
+  echo "no backup for $NAME under $BACKUPS"
+  echo
+  echo "Fallback (no backup needed): plug $NAME into Rekordbox and run Sync Manager."
+  echo "A lean stick has no PIONEER/ database, so Rekordbox treats it as a NEW device"
+  echo "and does a full fresh export (rebuilds PIONEER/ + Contents/ + Playlists/)."
+  echo "Then eject; re-strip with 'cdj400-usb --lean' before the next CDJ-400 use."
+  exit 1
+fi
+echo "Restoring $NAME from: $DIR ($(du -sh "$DIR" | cut -f1))"
+if [ ! -f "$DIR/.complete" ]; then
+  echo "WARN: no .complete marker — written by an older tool version, or the backup"
+  echo "      was interrupted. Restoring whatever PIONEER/Contents it does contain."
+fi
+RESTORED=""
+for part in PIONEER Contents; do
+  if [ ! -d "$DIR/$part" ]; then continue; fi
+  if [ -e "$USB/$part" ]; then
+    echo "REFUSE: $USB/$part already exists — resolve manually"; exit 1
+  fi
+  echo "  restoring $part ..."
+  rsync -a --checksum "$DIR/$part/" "$USB/$part/"
+  RESTORED="$RESTORED $part"
+done
+if [ -z "$RESTORED" ]; then
+  echo "REFUSE: this backup holds neither PIONEER/ nor Contents/ — nothing to restore."
+  echo "        Backup left untouched: $DIR"
+  exit 1
+fi
+dot_clean "$USB" 2>/dev/null || true
+find "$USB" -name '._*' -delete 2>/dev/null || true
+echo "Restored:$RESTORED"
+echo "Rekordbox will show the device out-of-date until the next sync — expected."
+if [ "$CONSUME" = "1" ]; then
+  echo "Deleting consumed backup: $DIR ($(du -sh "$DIR" | cut -f1))"
+  rm -rf "$DIR"
+  echo "Laptop side clean — the stick is now the only copy of that export."
+else
+  echo
+  echo "Backup kept: $DIR ($(du -sh "$DIR" | cut -f1))"
+  echo "It stays as $NAME's fast-restore path. Delete it once Rekordbox confirms the stick:"
+  echo "  rm -rf \"$DIR\""
+fi

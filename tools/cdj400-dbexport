@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""cdj400-dbexport — generate a fresh Rekordbox-format XML from the LIVE
+rekordbox library database (master.db), so the CDJ-400 tooling never has to
+rely on a hand-exported (and possibly stale) XML again.
+
+Why: a hand-exported *.xml is a snapshot taken at export time. master.db is the
+library's source of truth and is rewritten the moment a playlist changes — so
+the render source should come from here, and its mtime doubles as the freshness
+proof. Read-only: works on a COPY of the DB, safe while rekordbox runs.
+
+--device <usb-mount>: scope the export to the playlists that stick ACTUALLY has
+synced. The device writes its own manifest at
+  <usb>/PIONEER/rekordbox/playlists3Plus.sync   (and playlists3.sync)
+— plain XML listing the synced playlist IDs (hex; they are master.db playlist
+IDs). With --device, only those playlists are emitted, in device order, so a
+render can never invent folders for playlists that are not on the stick.
+
+Output parses identically to a real rekordbox XML for our tools
+(cdj400-finalize.py and cdj400-adopt).
+
+Usage:
+    cdj400-dbexport [-o OUT.xml] [--db PATH] [--device /Volumes/MYSTICK]
+
+Default output: ~/Documents/Rekordbox exports/library_<YYYY-MM-DD_HHMM>_from-db[_<device>].xml
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from xml.sax.saxutils import escape
+
+VENV_PY = Path.home() / "venvs" / "rekordbox" / "bin" / "python"
+DEFAULT_DB = Path.home() / "Library/Pioneer/rekordbox/master.db"
+SCRATCH = Path(tempfile.gettempdir()) / "cdj400"
+MANIFEST_CANDIDATES = ("playlists3Plus.sync", "playlists3.sync")
+
+# re-exec under the pyrekordbox venv if we're not already running there
+try:
+    from pyrekordbox import db6  # noqa: F401
+except ImportError:
+    if VENV_PY.exists() and os.environ.get("CDJ400_DBEXPORT_REEXEC") != "1":
+        os.environ["CDJ400_DBEXPORT_REEXEC"] = "1"
+        os.execve(str(VENV_PY), [str(VENV_PY), os.path.abspath(__file__), *sys.argv[1:]],
+                  os.environ)
+    sys.exit("pyrekordbox not available — create it with:\n"
+             "  python3 -m venv ~/venvs/rekordbox && "
+             "~/venvs/rekordbox/bin/pip install pyrekordbox")
+
+
+def kind_of(suffix: str) -> str:
+    s = suffix.lower().lstrip(".")
+    return {"mp3": "MP3 File", "wav": "WAV File", "aif": "AIFF File",
+            "aiff": "AIFF File", "flac": "FLAC File", "m4a": "M4A File"}.get(s, f"{s.upper()} File")
+
+
+def attr(s: str) -> str:
+    """XML-attribute-safe: escapes &, <, >, quotes; drops control chars."""
+    s = "".join(ch for ch in str(s) if ch >= " " or ch == "\t")
+    return escape(s, {'"': "&quot;", "'": "&apos;"})
+
+
+def device_manifest(usb: Path):
+    """[(playlist_id:int, dev_order:int, manifest_name)] from the stick's own
+    sync manifest, or None when no manifest exists (never synced / not a
+    rekordbox-prepared stick)."""
+    for fn in MANIFEST_CANDIDATES:
+        p = usb / "PIONEER/rekordbox" / fn
+        if not p.is_file():
+            continue
+        root = ET.parse(p).getroot()
+        entries = []
+        for n in root.iter("NODE"):
+            raw = n.get("Id")
+            if not raw or n.get("Attribute") != "0":   # 0 = playlist, 1 = folder
+                continue
+            pid = int(raw, 16)
+            if pid == 0:
+                continue
+            entries.append((pid, int(n.get("Dev_ID") or 0), fn))
+        return entries
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Export live rekordbox playlists to a rekordbox-format XML")
+    ap.add_argument("-o", "--out", type=Path, default=None,
+                    help="output xml path (default: ~/Documents/Rekordbox exports/library_<ts>_from-db.xml)")
+    ap.add_argument("--db", type=Path, default=DEFAULT_DB, help="rekordbox master.db path")
+    ap.add_argument("--device", type=Path, default=None,
+                    help="usb mount: export ONLY the playlists synced to that stick, "
+                         "per its PIONEER/rekordbox/playlists3Plus.sync manifest")
+    args = ap.parse_args()
+
+    if not args.db.is_file():
+        sys.exit(f"no rekordbox DB at {args.db}")
+
+    SCRATCH.mkdir(parents=True, exist_ok=True)
+    copy = SCRATCH / "master_for_export.db"
+    shutil.copy2(args.db, copy)
+
+    from pyrekordbox import db6
+    db = db6.Rekordbox6Database(path=copy)
+    pl_rows = db.get_playlist().all()
+
+    tracks: dict = {}     # content id -> (name, artist, uri, size, kind, bpm, key)
+    plists: list = []     # (name, [content ids])
+    for p in pl_rows:
+        ids = []
+        for s in sorted(p.Songs, key=lambda s: getattr(s, "TrackNo", 0) or 0):
+            c = getattr(s, "Content", None)
+            if c is None:
+                continue
+            cid = getattr(c, "ID", None)
+            if cid is None:
+                continue
+            if cid not in tracks:
+                folder = getattr(c, "FolderPath", "") or ""
+                fname = getattr(c, "FileName", "") or ""
+                path = Path(folder) / fname
+                uri = path.as_uri() if path.is_absolute() else ""
+                key = getattr(c, "Key", None)
+                tracks[cid] = (
+                    getattr(c, "Title", "") or "",
+                    getattr(c, "ArtistName", "") or "",
+                    uri,
+                    int(getattr(c, "FileSize", 0) or 0),
+                    kind_of(path.suffix),
+                    (getattr(c, "BPM", 0) or 0) / 100,
+                    (getattr(key, "ScaleName", "") or "") if key is not None else "",
+                )
+            ids.append(cid)
+        plists.append((p.Name, ids))
+
+    dev_keys = []
+    if args.device:
+        usb = args.device
+        manifest = device_manifest(usb)
+        if manifest is None:
+            sys.exit(f"no sync manifest under {usb}/PIONEER/rekordbox/ "
+                     "(playlists3Plus.sync / playlists3.sync).\n"
+                     "  That stick isn't in rekordbox mode or was never synced.\n"
+                     "  Re-sync it (Sync Manager), or omit --device to export all playlists.")
+        byid = {str(p.ID): p.Name for p in pl_rows}
+        wanted, unknown = [], []
+        for pid, dev_order, fn in manifest:
+            name = byid.get(str(pid))
+            if name is None:
+                unknown.append(f"{pid:X}")
+            else:
+                wanted.append((dev_order, name))
+        if unknown:
+            print(f"  warning: {len(unknown)} manifest id(s) not in library: {', '.join(unknown)}")
+        wanted.sort()
+        order = [n for _, n in wanted]
+        dev_keys = order
+        keep = set(order)
+        plists = sorted([(n, ids) for n, ids in plists if n in keep],
+                        key=lambda t: order.index(t[0]))
+        print(f"device manifest: {usb}")
+        print(f"  {len(order)} playlists synced to this stick (manifest {fn}):")
+        for n in order:
+            n_tracks = next((len(i) for nm, i in plists if nm == n), 0)
+            print(f"    - {n:<24s} {n_tracks:>4d} tracks")
+        if not plists:
+            sys.exit("no matching playlists in the library — nothing to render")
+
+    tag = f"_{args.device.name}" if args.device else ""
+    out = args.out or (Path.home() / "Documents" / "Rekordbox exports" /
+                       f"library_{time.strftime('%Y-%m-%d_%H%M')}_from-db{tag}.xml")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", encoding="utf-8") as fh:
+        fh.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+        fh.write('<DJ_PLAYLISTS Version="1.0.0">\n')
+        fh.write('  <PRODUCT Name="cdj400-dbexport" Version="1.0" Company="cdj400-ui"/>\n')
+        fh.write(f'  <COLLECTION Entries="{len(tracks)}">\n')
+        for cid, (name, artist, uri, size, kind, bpm, tonality) in tracks.items():
+            if not uri:
+                continue
+            fh.write(f'    <TRACK TrackID="{cid}" Name="{attr(name)}" Artist="{attr(artist)}" '
+                     f'Location="{attr(uri)}" Size="{size}" Kind="{kind}" '
+                     f'AverageBpm="{bpm:.2f}" Tonality="{attr(tonality)}"/>\n')
+        fh.write('  </COLLECTION>\n  <PLAYLISTS>\n')
+        fh.write(f'    <NODE Type="0" Name="ROOT" Count="{len(plists)}">\n')
+        for name, ids in plists:
+            fh.write(f'      <NODE Name="{attr(name)}" Type="1" KeyType="0" Entries="{len(ids)}">\n')
+            for cid in ids:
+                fh.write(f'        <TRACK Key="{cid}"/>\n')
+            fh.write('      </NODE>\n')
+        fh.write('    </NODE>\n  </PLAYLISTS>\n</DJ_PLAYLISTS>\n')
+
+    print(f"wrote {out}")
+    print(f"db mtime: {time.strftime('%Y-%m-%d %H:%M', time.localtime(args.db.stat().st_mtime))}"
+          f"  |  collection: {len(tracks)} tracks, {len(plists)} playlists"
+          f"{' (device-scoped)' if args.device else ''}")
+    for name, ids in plists:
+        print(f"  {name:<26s} {len(ids):>4d} tracks")
+
+    if args.device:
+        man = out.parent / (out.stem + ".manifest")
+        with man.open("w", encoding="utf-8") as fh:
+            subprocess.run(["find", str(args.device / "Contents"), "-type", "f"],
+                           check=True, stdout=fh, text=True)
+        print(f"  wrote contents manifest: {man}")
+
+
+if __name__ == "__main__":
+    main()

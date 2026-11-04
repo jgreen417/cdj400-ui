@@ -1,0 +1,101 @@
+#!/bin/bash
+# cdj400-prestrip — make room for a lean render when the export + Playlists/
+# can't both fit on a stick. The finalizer renders Playlists/ BEFORE the
+# --lean strip frees PIONEER/+Contents/, so on a stick that's ~90% full with
+# its Rekordbox export, the render runs out of space mid-copy. This backs up
+# PIONEER/ + Contents/ to ~/Music/DJ.CDJ400-BACKUPS/<stick>-<stamp>/
+# (count-verified), deletes them from the stick, and leaves it ready for:
+#   cdj400-usb --lean        (its strip step then no-ops)
+# Usage: cdj400-prestrip /Volumes/MYSTICK
+set -euo pipefail
+USB="${1:?usage: cdj400-prestrip <usb-mount>}"
+NAME="$(basename "$USB")"
+BACKUPS="$HOME/Music/DJ.CDJ400-BACKUPS"
+[ -d "$USB" ] || { echo "not mounted: $USB"; exit 1; }
+# A FAT stick can come back from a long Rekordbox export mounted but unable to
+# answer directory reads at all (kernel-level FAT state, not our bug). Probe it
+# with a timeout — macOS has no `timeout`, so the probe child runs backgrounded
+# and this shell times out on a sentinel file instead of ever blocking on it.
+probe_fs() {
+  local sentinel="${TMPDIR:-/tmp}/cdj400-fsprobe.$$"
+  rm -f "$sentinel"
+  ( ls -1 "$USB" >/dev/null 2>&1 && : > "$sentinel" ) &
+  local i=0
+  while [ "$i" -lt 40 ]; do
+    if [ -f "$sentinel" ]; then rm -f "$sentinel"; return 0; fi
+    sleep 0.2; i=$((i+1))
+  done
+  rm -f "$sentinel"; return 1
+}
+if ! probe_fs; then
+  echo "REFUSE: $USB is mounted but not answering I/O (unresponsive/corrupt FAT)."
+  echo "   Fix: diskutil eject it, unplug, plug back in — macOS runs fsck_msdos at"
+  echo "   mount. Or Disk Utility -> First Aid. Then re-run."
+  exit 1
+fi
+if [ ! -d "$USB/PIONEER" ] && [ ! -d "$USB/Contents" ]; then
+  echo "$NAME: nothing to prestrip (no PIONEER/ or Contents/)"; exit 0
+fi
+# Refuse to touch a stick that is being written right now (Sync Manager mid-export).
+if [ "${CDJ400_FORCE:-}" != "1" ]; then
+  HOT="$(find "$USB/PIONEER" "$USB/Contents" -type f \
+         -newermt "$(date -v-90S '+%Y-%m-%d %H:%M:%S')" 2>/dev/null | head -n 1 || true)"
+  if [ -n "$HOT" ]; then
+    echo "REFUSE: $NAME was written in the last 90s:"
+    echo "   $HOT"
+    echo "   Rekordbox Sync Manager is probably still exporting — backing up and"
+    echo "   deleting under a live sync corrupts it. Wait, or set CDJ400_FORCE=1."
+    exit 1
+  fi
+fi
+STAMP="$(date +%Y%m%d-%H%M%S)"
+BK="$BACKUPS/$NAME-$STAMP"
+# Two runs inside the same second must not merge into one dir: the marker would
+# then under-report its parts, which lets pruning drop a backup it shouldn't.
+if [ -d "$BK" ]; then BK="$BACKUPS/$NAME-$STAMP-$$"; fi
+mkdir -p "$BK"
+PARTS=""; TOTAL=0
+for part in PIONEER Contents; do
+  if [ ! -d "$USB/$part" ]; then echo "  $part: not present, skipping"; continue; fi
+  echo "  backing up $part ..."
+  rsync -a --checksum "$USB/$part/" "$BK/$part/"
+  n_src=$(find "$USB/$part" -type f | wc -l | tr -d ' ')
+  n_dst=$(find "$BK/$part" -type f | wc -l | tr -d ' ')
+  if [ "$n_src" != "$n_dst" ]; then
+    echo "VERIFY FAILED for $part: stick=$n_src backup=$n_dst — stick untouched"
+    exit 1
+  fi
+  PARTS="$PARTS${PARTS:+,}$part"; TOTAL=$((TOTAL + n_src))
+  echo "  verified $part: $n_src files"
+done
+# Completion marker: restore prefers a marked backup, and pruning only removes
+# an older backup this one fully supersedes.
+printf 'stick=%s\nparts=%s\nfiles=%s\nuuid=%s\nwritten=%s\n' \
+  "$NAME" "$PARTS" "$TOTAL" \
+  "$(diskutil info "$USB" 2>/dev/null | awk -F': *' '/Volume UUID/{print $2}')" \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$BK/.complete"
+echo "backup OK -> $BK (.complete: $PARTS, $TOTAL files)"
+# One backup per stick is enough — cdj400-restore only ever reads the newest,
+# so anything older is dead weight on the laptop.
+for old in "$BACKUPS/$NAME"-*; do
+  if [ ! -d "$old" ]; then continue; fi
+  if [ "$old" = "$BK" ]; then continue; fi
+  SUPERSEDED=1
+  for part in PIONEER Contents; do
+    if [ -d "$old/$part" ] && [ ! -d "$BK/$part" ]; then SUPERSEDED=0; fi
+  done
+  if [ "$SUPERSEDED" != "1" ]; then
+    echo "  keeping older backup (has parts this one lacks): $(basename "$old")"
+    continue
+  fi
+  echo "  pruning older backup: $(basename "$old") ($(du -sh "$old" | cut -f1))"
+  rm -rf "$old"
+done
+for part in PIONEER Contents; do
+  if [ -d "$USB/$part" ]; then
+    rm -rf "$USB/$part"
+    echo "  deleted $part from stick"
+  fi
+done
+df -h "$USB" | tail -1
+echo "prestrip done — now run: cdj400-usb --lean"

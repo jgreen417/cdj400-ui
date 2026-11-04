@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+"""cdj400-adopt — build the lean Playlists/ render from the audio ALREADY on
+the stick (Contents/), instead of re-copying everything from the Mac.
+
+A Rekordbox device export lays out Contents/<Artist>/<Album>/<name>.mp3.
+The lean render wants Playlists/<playlist>/<track>.mp3. Both trees live on the
+same FAT32 volume, so moving a file between them is an instant rename — no
+data copied. Only tracks needed by 2+ playlists (or not present in the export)
+cost a real copy (same-volume copy or a fallback copy from the Mac).
+
+Manifest-first: feed this a device-scoped XML (see cdj400-dbexport --device),
+so the folder set matches the playlists actually synced to the stick.
+
+Matching: refs come from the XML; export filenames may be truncated and/or
+NFC/NFD-normalised differently vs the Mac originals, so we compare casefolded
+NFC-normalised names: exact first, then truncated-prefix (ignoring an export
+'-N' collision suffix). BYTE SIZE IS AUTHORITATIVE: real exports contain stale
+same-name files with different bytes, so when the XML knows the size, a
+candidate whose size differs is rejected — we fall through to the '-N' variant
+or copy the Mac original rather than placing the wrong audio.
+
+Stale-XML guard: Rekordbox rewrites master.db on every library edit. If the
+library is meaningfully newer than the XML, the XML is probably missing recent
+playlist changes, so we print a loud warning and pause 15s (--force skips).
+
+Safety: --execute wipes any partial Playlists/ render first, then refuses to
+delete anything (PIONEER/, leftover Contents/, junk) unless every planned
+file verifies present in Playlists/ afterwards. Default is a dry run.
+
+--resume: repair/finish an interrupted run without wiping. Entries already
+placed with the right bytes are kept; missing or wrong-sized ones are fixed
+(preferring a correct copy already in Playlists/, then the planned move, then
+the Mac original), then the same verify-then-clean-up gate applies.
+
+Before PIONEER/ is deleted, its device DBs + sync manifest are copied to
+~/Music/DJ.USB-DEVICEDBS/<stick>-<date>/ so "what playlists lived on this
+stick" stays answerable (the .sync file is plain XML; export.pdb is DeviceSQL).
+
+Usage:
+  cdj400-adopt <rekordbox.xml> <usb-mount>            # dry run
+  cdj400-adopt <rekordbox.xml> <usb-mount> --execute  # perform
+  cdj400-adopt <rekordbox.xml> <usb-mount> --resume   # finish/repair
+"""
+import argparse
+import re
+import shutil
+import subprocess
+import sys
+import time
+import unicodedata
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+import xml.etree.ElementTree as ET
+
+JUNK = [".Spotlight-V100", ".fseventsd", ".Trashes", ".TemporaryItems",
+        "System Volume Information"]
+DEVICEDB_HOME = Path.home() / "Music/DJ.USB-DEVICEDBS"
+RB_DB = Path.home() / "Library/Pioneer/rekordbox/master.db"
+STALE_GRACE = 1800  # seconds the XML may trail the library before we complain
+
+
+def mac_path(loc):
+    return Path(unquote(urlparse(loc).path)) if loc else None
+
+
+def norm(s):
+    return unicodedata.normalize("NFC", s).casefold()
+
+
+def fmt_time(ts):
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+
+def stale_guard(xml, force):
+    if force or not RB_DB.exists():
+        return
+    lag = RB_DB.stat().st_mtime - xml.stat().st_mtime
+    if lag <= STALE_GRACE:
+        return
+    print()
+    print("  " + "!" * 68)
+    print(f"  !! STALE XML: {xml.name} was exported {fmt_time(xml.stat().st_mtime)}")
+    print(f"  !! but your Rekordbox library changed {fmt_time(RB_DB.stat().st_mtime)}"
+          f" ({lag / 86400:.1f} days newer).")
+    print("  !! Playlists may have changed since this export.")
+    print("  !! Fix: run cdj400-dbexport --device <usb> for a live export,")
+    print("  !! or pass --force to use this XML anyway.")
+    print("  " + "!" * 68)
+    print("  continuing in 15s — Ctrl+C to abort", flush=True)
+    try:
+        time.sleep(15)
+    except KeyboardInterrupt:
+        sys.exit("\naborted — no changes made")
+
+
+def fs_alive(path, timeout: int = 8) -> bool:
+    """True when `path` answers a directory read within `timeout` seconds.
+
+    Runs in a child process so the parent can give up even if the volume hangs
+    in the kernel (an in-process stat() would block forever, uninterruptible)."""
+    code = "import os,sys; os.listdir(sys.argv[1])"
+    p = subprocess.Popen([sys.executable, "-c", code, str(path)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        p.kill()          # no second wait: a hung child may never reap
+        return False
+    return p.returncode == 0
+
+
+def rmtree_force(path) -> bool:
+    """rmtree with an unlock retry; True when the path is gone afterwards."""
+    if not path.exists():
+        return True
+    try:
+        shutil.rmtree(path)
+    except OSError:
+        subprocess.run(["chmod", "-R", "u+rwX", str(path)], check=False,
+                       capture_output=True)
+        try:
+            shutil.rmtree(path)
+        except OSError:
+            pass
+    return not path.exists()
+
+
+def rmrf(path):
+    """Batch delete via `rm -rf` — an order of magnitude faster than Python
+    rmtree on FAT (C-level inode walk vs Python-level recursion)."""
+    subprocess.run(["rm", "-rf", str(path)], check=False, capture_output=True)
+
+
+def stash_device_dbs(usb):
+    """Keep the stick's device DB + sync manifest on the Mac before the strip
+    deletes them — they record which playlists were synced to that stick."""
+    src = usb / "PIONEER/rekordbox"
+    if not src.is_dir():
+        return
+    dest = DEVICEDB_HOME / f"{usb.name}-{time.strftime('%Y%m%d')}"
+    dest.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for p in src.iterdir():
+        if not p.is_file() or p.suffix not in (".pdb", ".db", ".sync",
+                                               ".db-wal", ".db-shm"):
+            continue
+        try:
+            shutil.copy2(p, dest / p.name)
+            n += 1
+        except OSError:
+            pass
+    if n:
+        print(f"  stashed {n} device DB/manifest files -> {dest}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("xml")
+    ap.add_argument("usb")
+    ap.add_argument("--execute", action="store_true")
+    ap.add_argument("--resume", action="store_true",
+                    help="finish/repair a partial run: keep correct entries, "
+                         "fix missing/wrong ones, then verify + clean up")
+    ap.add_argument("--force", action="store_true",
+                    help="skip the stale-XML warning pause")
+    ap.add_argument("--skip-over", type=int, default=500)
+    ap.add_argument("--min-prefix", type=int, default=16)
+    args = ap.parse_args()
+
+    usb = Path(args.usb)
+    xml = Path(args.xml)
+    if not xml.is_file():
+        sys.exit(f"no such XML: {xml}")
+    stale_guard(xml, args.force)
+    if not usb.is_dir():
+        sys.exit(f"not mounted: {usb}")
+    contents = usb / "Contents"
+    if not contents.is_dir():
+        sys.exit(f"no {contents} — stick is not in export mode, nothing to adopt")
+    pl_root = usb / "Playlists"
+
+    root = ET.parse(xml).getroot()
+    tracks = {}
+    for tr in root.find("COLLECTION"):
+        tracks[tr.get("TrackID")] = {
+            "path": mac_path(tr.get("Location")),
+            "size": int(tr.get("Size") or 0),
+        }
+    playlists = []
+    for node in root.find("PLAYLISTS").iter("NODE"):
+        if node.get("Type") == "1":
+            refs = [t.get("Key") for t in node.findall("TRACK")]
+            if refs and len(refs) <= args.skip_over:
+                playlists.append((node.get("Name"), refs))
+
+    print(f"XML: {xml}  (exported {fmt_time(xml.stat().st_mtime)})")
+    print(f"playlists to build ({len(playlists)}):")
+    for name, refs in playlists:
+        print(f"  {name:<28s} {len(refs):>4d} tracks")
+    print()
+
+    # Pre-flight: a FAT stick that has been through a long Rekordbox export can
+    # end up mounted but unable to answer any directory read. Probe in a child
+    # process with a timeout — an in-process stat() would hang the whole run.
+    if not fs_alive(contents.parent):
+        print(f"\nREFUSE: {contents.parent} is mounted but not answering I/O "
+              "(unresponsive / corrupt FAT).")
+        print("   Fix: eject it (diskutil eject), unplug, plug it back in — macOS")
+        print("   runs fsck_msdos at mount. Or Disk Utility -> First Aid.")
+        print("   Then re-run the render. Do NOT force-unmount mid-export, and do")
+        print("   not keep hammering the volume while it is in this state.")
+        sys.exit(1)
+
+    index = {}
+    manifest_path = xml.parent / (xml.stem + ".manifest")
+    if manifest_path.is_file():
+        src = manifest_path.read_text(encoding="utf-8").strip().splitlines()
+    else:
+        # no manifest (legacy XML or not exported by dbexport --device)
+        src = subprocess.run(
+            ["find", str(contents), "-type", "f"],
+            capture_output=True, text=True, check=True
+        ).stdout.strip().splitlines()
+    for p in src:
+        if not p:
+            continue
+        p = Path(p)
+        if p.name.startswith("._"):
+            continue
+        index.setdefault(norm(p.name), []).append(p)
+
+    def find_match(name, size):
+        """Locate this track on the stick. Size (when known) is authoritative:
+        exports carry stale same-name files with different bytes, so a
+        candidate whose size disagrees is NOT the track we want — fall through
+        to the truncated '-N' variant, or let the caller copy from the Mac."""
+        n = norm(name)
+        cands = index.get(n, [])
+        if cands:
+            if size:
+                sized = [c for c in cands if c.stat().st_size == size]
+                if sized:
+                    return sized[0], "exact"
+            else:
+                return cands[0], "exact"
+        stem = norm(name[:-4]) if name.lower().endswith(".mp3") else norm(name)
+        pref = []
+        for cname, paths in index.items():
+            cstem = cname[:-4] if cname.endswith(".mp3") else cname
+            cbase = re.sub(r"-\d+$", "", cstem).strip()
+            if len(cbase) >= args.min_prefix and stem.startswith(cbase):
+                pref += paths
+        if not pref:
+            return None, "missing"
+        if size:
+            sized = [c for c in pref if c.stat().st_size == size]
+            if sized:
+                return sized[0], "prefix+size"
+            return None, "size-mismatch"
+        if len(pref) == 1:
+            return pref[0], "prefix"
+        return None, f"ambiguous({len(pref)})"
+
+    plan = []            # dicts: pl, name, size, kind, src / mac / owner
+    owner_of = {}        # contents path -> (pl, name)
+    stats = {"move": 0, "stickcopy": 0, "maccopy": 0}
+    missing, ambiguous = [], []
+
+    for pl, refs in playlists:
+        seen = set()
+        for key in refs:
+            t = tracks.get(key)
+            if not t or not t["path"]:
+                continue
+            m = t["path"]
+            if str(m) in seen:
+                continue
+            seen.add(str(m))
+            if not m.is_file():
+                missing.append((pl, m.name, "mac-file-gone"))
+                continue
+            size = t["size"] or m.stat().st_size
+            src, how = find_match(m.name, size)
+            if src is None and how.startswith("ambiguous"):
+                ambiguous.append((pl, m.name, how))
+                continue
+            if src is None:
+                plan.append(dict(pl=pl, name=m.name, size=size, mac=m,
+                                 kind="maccopy"))
+                stats["maccopy"] += 1
+            elif src in owner_of:
+                plan.append(dict(pl=pl, name=m.name, size=size, mac=m,
+                                 kind="stickcopy", owner=owner_of[src]))
+                stats["stickcopy"] += 1
+            else:
+                owner_of[src] = (pl, m.name)
+                plan.append(dict(pl=pl, name=m.name, size=size, mac=m,
+                                 kind="move", src=src))
+                stats["move"] += 1
+
+    used = set(owner_of)
+    leftover = [p for v in index.values() for p in v if p not in used]
+    leftover_gb = sum(p.stat().st_size for p in leftover if p.exists()) / 1e9
+
+    print(f"XML playlists: {len(playlists)} | refs planned: {len(plan)}")
+    print(f"  moves (instant renames):   {stats['move']}")
+    print(f"  on-stick copies (dupes):   {stats['stickcopy']}")
+    print(f"  mac copies (not exported): {stats['maccopy']}")
+    for x in missing:
+        print("  MISSING:", x)
+    for x in ambiguous:
+        print("  AMBIGUOUS:", x)
+    print(f"  leftover Contents to delete: {len(leftover)} files / {leftover_gb:.2f} GB")
+
+    if not (args.execute or args.resume):
+        print("\ndry run only — pass --execute to perform "
+              "(or --resume to finish/repair a partial run)")
+        return
+
+    # Refuse to mutate a stick that is being written right now. Rekordbox Sync
+    # Manager holds the stick open while exporting, and moving files under a
+    # live export corrupts it. Dry runs are read-only and skip this check.
+    if subprocess.run(["printenv", "CDJ400_FORCE"], capture_output=True,
+                      text=True).stdout.strip() != "1":
+        cutoff = subprocess.run(["date", "-v-90S", "+%Y-%m-%d %H:%M:%S"],
+                                capture_output=True, text=True).stdout.strip()
+        hot = ""
+        for part in ("PIONEER", "Contents"):
+            d = usb / part
+            if not d.exists():
+                continue
+            hit = subprocess.run(["find", str(d), "-type", "f", "-newermt", cutoff],
+                                 capture_output=True, text=True).stdout.strip()
+            if hit:
+                hot = hit.splitlines()[0]
+                break
+        if hot:
+            print(f"\nREFUSE: {usb.name} was written in the last 90s:")
+            print(f"   {hot}")
+            print("   Rekordbox Sync Manager is probably still exporting. Moving files")
+            print("   while it writes corrupts the sync. Wait for it to stop, or re-run")
+            print("   with CDJ400_FORCE=1 if you know it has finished.")
+            sys.exit(1)
+
+    if args.execute:
+        rmtree_force(pl_root)  # wipe any partial render from a crashed run
+    else:
+        print("\n--resume: keeping existing Playlists/, repairing missing/wrong entries")
+
+    # what's already in Playlists/ (name+size) — donors for dupes + repairs
+    have = {}
+    for p in pl_root.rglob("*"):
+        if p.is_file() and not p.name.startswith("._"):
+            have.setdefault((norm(p.name), p.stat().st_size), []).append(p)
+
+    def donor_for(e, dest):
+        for p in have.get((norm(e["name"]), e["size"]), []):
+            if p != dest and p.exists():
+                return p
+        return None
+
+    fixed = kept = 0
+    failures = []
+    for e in plan:
+        dest = pl_root / e["pl"] / e["name"]
+        if dest.exists():
+            if dest.stat().st_size == e["size"]:
+                kept += 1
+                continue
+            dest.unlink()          # wrong bytes (stale duplicate) → replace
+            fixed += 1
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            d = donor_for(e, dest)
+            if d is not None:
+                shutil.copyfile(d, dest)
+            elif e["kind"] == "move" and e.get("src") and e["src"].exists():
+                shutil.move(str(e["src"]), str(dest))
+            elif e["kind"] == "stickcopy":
+                owner_dest = pl_root / e["owner"][0] / e["owner"][1]
+                shutil.copyfile(owner_dest if owner_dest.exists() else e["mac"], dest)
+            else:  # maccopy, or a move whose source was consumed earlier
+                shutil.copyfile(e["mac"], dest)
+            have.setdefault((norm(e["name"]), e["size"]), []).append(dest)
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"{dest} — {type(exc).__name__}: {exc}")
+
+    bad = [f"{pl_root / e['pl'] / e['name']}"
+           for e in plan
+           if not (pl_root / e["pl"] / e["name"]).exists()
+           or (pl_root / e["pl"] / e["name"]).stat().st_size != e["size"]]
+    if bad:
+        print("\nVERIFY FAILED — nothing deleted; investigate:")
+        for b in bad[:20]:
+            print("  ", b)
+        for f in failures[:10]:
+            print("  err:", f)
+        sys.exit(1)
+
+    print(f"verify OK: {len(plan)} files present with correct bytes "
+          f"({kept} kept, {fixed} replaced)")
+    stash_device_dbs(usb)
+    for target in [usb / "PIONEER", usb / "Contents"]:
+        if target.exists():
+            rmrf(target)
+            print("  deleted", target.name)
+    for target in [usb / j for j in JUNK]:
+        if not target.exists():
+            continue
+        if rmtree_force(target):
+            print("  deleted", target.name)
+        else:
+            print(f"  kept {target.name} (macOS-protected; empty is harmless)")
+    subprocess.run(["dot_clean", str(usb)], check=False, capture_output=True)
+    for p in pl_root.rglob("._*"):
+        p.unlink(missing_ok=True)
+    # A Spotlight index makes legacy players chew through thousands of invisible
+    # files on first scan: turn indexing off so macOS stops regrowing
+    # .Spotlight-V100 (and fresh ._* sidecars) every time the stick is mounted.
+    subprocess.run(["mdutil", "-i", "off", str(usb)], check=False, capture_output=True)
+    print(f"\nadopted {len(plan)} files into Playlists/ — now run: cdj400-usb --check")
+
+
+if __name__ == "__main__":
+    main()

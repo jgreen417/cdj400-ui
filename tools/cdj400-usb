@@ -1,0 +1,115 @@
+#!/bin/bash
+# cdj400-usb — one-shot: finish every plugged-in DJ stick for CDJ-400 duty after a Rekordbox sync.
+# Finds the newest Rekordbox XML export in ~/Documents/Rekordbox exports (or use $1), then runs
+# cdj400-finalize.py on every known stick that's plugged in.
+#
+# Usage:  cdj400-usb            # newest XML, all plugged sticks
+#         cdj400-usb FILE.xml   # explicit XML
+#         cdj400-usb --check    # report readiness only, change nothing
+#         cdj400-usb --lean     # also strip PIONEER/ + Contents/ (backed up) for
+#                               #   fast CDJ-400 reads; modern sets need re-sync
+set -u
+
+# Sticks to finish: $CDJ400_STICKS (space-separated mount points), or every
+# mounted volume that looks like Rekordbox media.
+if [ -n "${CDJ400_STICKS:-}" ]; then
+  read -ra STICKS <<< "$CDJ400_STICKS"
+else
+  STICKS=()
+  for v in /Volumes/*; do
+    if [ -d "$v/PIONEER" ] || [ -d "$v/Contents" ] || [ -d "$v/Playlists" ]; then STICKS+=("$v"); fi
+  done
+fi
+if [ "${#STICKS[@]}" -eq 0 ]; then
+  echo "No CDJ sticks plugged in."
+  exit 0
+fi
+FINALIZER="$(cd "$(dirname "$0")" && pwd)/cdj400-finalize.py"
+CHECK=0
+LEAN=0
+XML=""
+
+for a in "$@"; do
+  case "$a" in
+    --check) CHECK=1 ;;
+    --lean) LEAN=1 ;;
+    *) XML="$a" ;;
+  esac
+done
+
+# A FAT stick can be mounted yet answer no directory reads at all after a long
+# Rekordbox export. Prove it with a timeout (macOS has no `timeout` command):
+# the probe child is backgrounded, so this shell can never block on it.
+probe_fs() {
+  local sentinel="${TMPDIR:-/tmp}/cdj400-fsprobe.$$"
+  rm -f "$sentinel"
+  ( ls -1 "$1" >/dev/null 2>&1 && : > "$sentinel" ) &
+  local i=0
+  while [ "$i" -lt 40 ]; do
+    if [ -f "$sentinel" ]; then rm -f "$sentinel"; return 0; fi
+    sleep 0.2; i=$((i+1))
+  done
+  rm -f "$sentinel"; return 1
+}
+
+if [ "$CHECK" = 1 ]; then
+  for usb in "${STICKS[@]}"; do
+    [ -d "$usb" ] || { echo "❌ $usb not mounted"; continue; }
+    if ! probe_fs "$usb"; then
+      echo "⚠️ $(basename "$usb"): mounted but NOT answering I/O (unresponsive/corrupt FAT)"
+      echo "   → eject + replug (macOS runs fsck_msdos at mount), or Disk Utility → First Aid"
+      continue
+    fi
+    sidecars=$(find "$usb" -name '._*' 2>/dev/null | wc -l | tr -d ' ')
+    mp3s=$(find "$usb/Playlists" -name '*.mp3' ! -name '._*' 2>/dev/null | wc -l | tr -d ' ')
+    folders=$(find "$usb/Playlists" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+    free=$(df -m "$usb" | awk 'NR==2{print $4}')
+    if [ "$mp3s" -eq 0 ] || [ "$folders" -eq 0 ]; then
+      if [ -d "$usb/PIONEER" ] || [ -d "$usb/Contents" ]; then
+        verdict='⚠️ Rekordbox/full mode — run: cdj400-usb --lean'
+      else
+        verdict='⚠️ no Playlists render (empty, erased, or mid-sync)'
+      fi
+    elif [ "$sidecars" -eq 0 ]; then
+      verdict='✅ CDJ-400 clean'
+    else
+      verdict='⚠️ needs finalize'
+    fi
+    printf '%s: %s playlists, %s mp3s, %s sidecars, %s MB free → %s\n' \
+      "$(basename "$usb")" "$folders" "$mp3s" "$sidecars" "$free" "$verdict"
+    idx=$(mdutil -s "$usb" 2>/dev/null)
+    if ! echo "$idx" | grep -qi "disabled"; then
+      echo "  ⚠️ Spotlight indexing is ON — will regrow .Spotlight-V100 and sidecars;"
+      echo "     run: mdutil -i off \"$usb\""
+    fi
+  done
+  exit 0
+fi
+
+if [ -z "$XML" ]; then
+  # Exports consolidated into ~/Documents/Rekordbox exports on 2026-10-01; top level kept as a fallback.
+  XML=$(ls -t "$HOME/Documents/Rekordbox exports"/*.xml "$HOME/Documents"/*.xml 2>/dev/null | head -n 1)
+fi
+if [ -z "$XML" ] || [ ! -f "$XML" ]; then
+  echo "No XML found. Export from Rekordbox: File → Library → Export Collection in xml format."
+  echo "Then rerun: cdj400-usb \"$HOME/Documents/Rekordbox exports/<your-export>.xml\""
+  exit 1
+fi
+echo "Using XML: $XML"
+
+ran=0
+for usb in "${STICKS[@]}"; do
+  if [ -d "$usb" ]; then
+    echo; echo "=== finalizing $usb ==="
+    if [ "$LEAN" = 1 ]; then
+      python3 "$FINALIZER" "$XML" "$usb" --lean && ran=1
+    else
+      python3 "$FINALIZER" "$XML" "$usb" && ran=1
+    fi
+  else
+    echo; echo "=== $usb not mounted — skipped ==="
+  fi
+done
+
+[ "$ran" = 1 ] || { echo "No sticks finalized."; exit 1; }
+echo; echo "Done. Deck test: stick in BEFORE power-on → press USB once → allow up to 90s first read."

@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""cdj400-copystick — copy a lean stick's Playlists/ onto another stick.
+
+Usage:
+  cdj400-copystick <from-usb> <to-usb>             # dry run (default)
+  cdj400-copystick <from-usb> <to-usb> --execute   # copy
+
+Additive and safe to re-run: files already on the target with the right size are
+kept, nothing on the target is deleted. Copies data only (no xattrs), so macOS
+creates no ._ sidecars on FAT.
+
+Machine-readable progress lines (for the app):  PROGRESS <bytes_done> <bytes_total>
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import sys
+import time
+from pathlib import Path
+
+
+def fmt_bytes(n: float) -> str:
+    return f"{n / 1e6:,.0f} MB" if n < 1e9 else f"{n / 1e9:.2f} GB"
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("source")
+    ap.add_argument("target")
+    ap.add_argument("--execute", action="store_true")
+    args = ap.parse_args()
+
+    src_root = Path(args.source) / "Playlists"
+    dst_usb = Path(args.target)
+    if not src_root.is_dir():
+        sys.exit(f"no Playlists/ on {args.source}")
+    if not dst_usb.is_dir():
+        sys.exit(f"not mounted: {dst_usb}")
+    if dst_usb.resolve() == Path(args.source).resolve():
+        sys.exit("source and target are the same stick")
+    dst_root = dst_usb / "Playlists"
+
+    plan = []
+    for src in sorted(src_root.rglob("*")):
+        if src.is_file() and not src.name.startswith("._") and not src.name.endswith(".part"):
+            plan.append((src, dst_root / src.relative_to(src_root), src.stat().st_size))
+    todo = [(s, d, z) for s, d, z in plan if not (d.is_file() and d.stat().st_size == z)]
+    need = sum(z for _, _, z in todo)
+    free = shutil.disk_usage(dst_usb).free
+    folders = {s.relative_to(src_root).parts[0] for s, _, _ in plan}
+
+    print(f"{args.source} -> {dst_root}")
+    print(f"  {len(folders)} playlists, {len(plan)} files "
+          f"({len(plan) - len(todo)} already there, {len(todo)} to copy, {fmt_bytes(need)})")
+    if need * 1.05 + (50 << 20) > free:
+        sys.exit(f"NOT ENOUGH SPACE: need ~{fmt_bytes(need)}, target has {fmt_bytes(free)} free")
+    if not args.execute:
+        print("\ndry run only — pass --execute to copy")
+        return
+
+    done, t0 = 0, time.time()
+    print(f"PROGRESS 0 {need}", flush=True)
+    for src, dest, size in todo:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(dest.name + ".part")
+        shutil.copyfile(src, tmp)
+        os.utime(tmp, (src.stat().st_atime, src.stat().st_mtime))
+        os.replace(tmp, dest)
+        done += size
+        rate = done / max(time.time() - t0, 0.01)
+        print(f"PROGRESS {done} {need}  {rate / 1e6:.1f}MB/s  {dest.name}", flush=True)
+
+    bad = [d for _, d, z in plan if not d.is_file() or d.stat().st_size != z]
+    if bad:
+        print("\nVERIFY FAILED:")
+        for b in bad[:20]:
+            print("  ", b)
+        sys.exit(1)
+    for p in dst_root.rglob("._*"):
+        p.unlink(missing_ok=True)
+    print(f"\ncopied {len(todo)} files in {time.time() - t0:.0f}s — "
+          f"{dst_usb.name} now has all {len(folders)} playlists from {Path(args.source).name}")
+
+
+if __name__ == "__main__":
+    main()

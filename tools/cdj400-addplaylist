@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""cdj400-addplaylist — add ONE Rekordbox playlist to a lean (CDJ-400) stick as
+Playlists/<name>/, copying only that playlist's MP3s from the Mac.
+
+No Rekordbox sync, no restore: the CDJ-400 reads plain folders, so a playlist
+that already lives in the Rekordbox library only needs its files copied.
+
+Usage:
+  cdj400-addplaylist <usb> --list                     # playlists not on the stick: name, tracks, MP3 bytes
+  cdj400-addplaylist <usb> "<playlist>"               # dry run (default)
+  cdj400-addplaylist <usb> "<playlist>" --execute     # copy
+  cdj400-addplaylist <usb> "<playlist>" --execute --prune
+                                                      # copy, then delete tracks no longer in the playlist
+  cdj400-addplaylist <usb> --status                   # per folder: tracks to copy, tracks to prune, bytes
+
+Safe to re-run: files already on the stick with the right size are kept, only
+missing or wrong-sized ones are copied. Other playlist folders are never touched.
+Copies data only (no xattrs), so macOS creates no ._ sidecars on FAT.
+
+Machine-readable progress lines (for the app):  PROGRESS <bytes_done> <bytes_total>
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import unicodedata
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent  # sibling cdj400-* tools live here
+DBEXPORT = HERE / "cdj400-dbexport"
+SCRATCH = Path(tempfile.gettempdir()) / "cdj400"
+FAT32_BAD = '<>:"/\\|?*'
+MAX_BASENAME = 100
+
+
+def fat32_safe(name: str) -> str:
+    name = "".join(c for c in name if c not in FAT32_BAD).strip().rstrip(".")
+    if len(name) > MAX_BASENAME:
+        stem, dot, ext = name.rpartition(".")
+        stem = stem[: MAX_BASENAME - len(ext) - 1] if dot else name[:MAX_BASENAME]
+        name = f"{stem}.{ext}" if dot else stem
+    return name or "untitled"
+
+
+def url_to_path(url: str) -> Path | None:
+    if not url.startswith("file://"):
+        return None
+    return Path(urllib.request.url2pathname(urllib.parse.urlparse(url).path))
+
+
+def load_library(xml: Path):
+    """({TrackID: (path, size)}, {playlist name: [TrackID]}) from a dbexport XML."""
+    root = ET.parse(xml).getroot()
+    tracks = {}
+    for tr in root.find("COLLECTION"):
+        p = url_to_path(tr.get("Location", ""))
+        if p is not None:
+            tracks[tr.get("TrackID")] = (p, int(tr.get("Size") or 0))
+    playlists = {}
+    for node in root.find("PLAYLISTS").iter("NODE"):
+        if node.get("Type") == "1":
+            playlists[node.get("Name")] = [t.get("Key") for t in node.findall("TRACK")]
+    return tracks, playlists
+
+
+def export_library(out: Path) -> None:
+    out.parent.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run([str(DBEXPORT), "-o", str(out)], capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit(f"cdj400-dbexport failed:\n{r.stdout}{r.stderr}")
+
+
+def on_stick(pl_root: Path) -> set[str]:
+    if not pl_root.is_dir():
+        return set()
+    return {unicodedata.normalize("NFC", p.name).casefold()
+            for p in pl_root.iterdir() if p.is_dir() and not p.name.startswith(".")}
+
+
+def norm(name: str) -> str:
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def find_folder(pl_root: Path, playlist: str) -> Path:
+    """The stick's folder for this playlist. cdj400-adopt names folders after the
+    raw playlist name, this tool after its FAT-safe form; accept either."""
+    wanted = {norm(playlist), norm(fat32_safe(playlist))}
+    if pl_root.is_dir():
+        for p in pl_root.iterdir():
+            if p.is_dir() and norm(p.name) in wanted:
+                return p
+    return pl_root / fat32_safe(playlist)
+
+
+ORDER_FILE = ".cdj400-order.json"
+SORTER = HERE / "cdj400-sort"
+
+
+def sort_order(folder: Path) -> dict:
+    """What cdj400-sort recorded: {"by": ..., "original": {current name: original name}}."""
+    try:
+        return json.loads((folder / ORDER_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def files_in(folder: Path) -> dict[str, tuple[Path, int]]:
+    """norm(original name) -> (path, size). A sorted folder's "001 - " names map
+    back to the original names cdj400-sort recorded."""
+    if not folder.is_dir():
+        return {}
+    original = sort_order(folder).get("original", {})
+    return {norm(original.get(p.name, p.name)): (p, p.stat().st_size) for p in folder.iterdir()
+            if p.is_file() and not p.name.startswith(".") and not p.name.endswith(".part")}
+
+
+def on_disk(have, src: Path, dest: Path, size: int) -> bool:
+    """A track counts as present under its FAT-safe name (this tool) or its raw
+    Mac name (cdj400-adopt), as long as the bytes match."""
+    return any(have.get(norm(n), (None, -1))[1] == size for n in (dest.name, src.name))
+
+
+def extras(have, plan) -> list[Path]:
+    expected = {norm(n) for src, dest, _ in plan for n in (dest.name, src.name)}
+    return sorted(p for key, (p, _) in have.items() if key not in expected)
+
+
+def build_plan(refs, tracks, folder: Path):
+    """[(src, dest, size)] for MP3s, plus skipped-non-mp3 and missing lists."""
+    plan, skipped, missing = [], [], []
+    seen_src, seen_name = set(), set()
+    for key in refs:
+        t = tracks.get(key)
+        if not t:
+            continue
+        src, size = t
+        if not src.is_file():
+            missing.append(src)
+            continue
+        if src.suffix.lower() != ".mp3":
+            skipped.append(src)
+            continue
+        if src in seen_src:
+            continue
+        seen_src.add(src)
+        dest_name = fat32_safe(src.name)
+        n = 2
+        while dest_name.casefold() in seen_name:
+            stem, _, ext = src.name.rpartition(".")
+            dest_name = fat32_safe(f"{stem} [{n}].{ext}")
+            n += 1
+        seen_name.add(dest_name.casefold())
+        plan.append((src, folder / dest_name, src.stat().st_size))
+    return plan, skipped, missing
+
+
+def fmt_bytes(n: float) -> str:
+    return f"{n / 1e6:,.0f} MB" if n < 1e9 else f"{n / 1e9:.2f} GB"
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("usb")
+    ap.add_argument("playlist", nargs="?")
+    ap.add_argument("--list", action="store_true", help="list library playlists not yet on the stick")
+    ap.add_argument("--status", action="store_true",
+                    help="compare every playlist folder on the stick with Rekordbox")
+    ap.add_argument("--prune", action="store_true",
+                    help="after copying, delete tracks no longer in the playlist")
+    ap.add_argument("--execute", action="store_true")
+    ap.add_argument("--xml", help="use this dbexport XML instead of exporting the live library")
+    args = ap.parse_args()
+
+    usb = Path(args.usb)
+    if not usb.is_dir():
+        sys.exit(f"not mounted: {usb}")
+    pl_root = usb / "Playlists"
+
+    if args.xml:
+        xml = Path(args.xml)
+    else:
+        xml = SCRATCH / "addplaylist-library.xml"
+        export_library(xml)
+    tracks, playlists = load_library(xml)
+
+    if args.list:
+        have = on_stick(pl_root)
+        for name, refs in playlists.items():
+            if unicodedata.normalize("NFC", fat32_safe(name)).casefold() not in have and refs:
+                mp3s = {tracks[k] for k in refs
+                        if k in tracks and tracks[k][0].suffix.lower() == ".mp3"}
+                print(f"{name}\t{len(refs)}\t{sum(size for _, size in mp3s)}")
+        return
+
+    if args.status:
+        by_folder = {}
+        for name in playlists:
+            by_folder.setdefault(norm(name), name)
+            by_folder.setdefault(norm(fat32_safe(name)), name)
+        if pl_root.is_dir():
+            for folder in sorted(p for p in pl_root.iterdir()
+                                 if p.is_dir() and not p.name.startswith(".")):
+                name = by_folder.get(norm(folder.name))
+                if name is None:
+                    print(f"{folder.name}\t\t-1\t-1\t0")
+                    continue
+                plan, _, _ = build_plan(playlists[name], tracks, folder)
+                have = files_in(folder)
+                todo = [(s, d, z) for s, d, z in plan if not on_disk(have, s, d, z)]
+                print(f"{folder.name}\t{name}\t{len(todo)}\t{len(extras(have, plan))}"
+                      f"\t{sum(z for _, _, z in todo)}")
+        return
+
+    if not args.playlist:
+        sys.exit("give a playlist name, or --list")
+    if args.playlist not in playlists:
+        close = [n for n in playlists if args.playlist.casefold() in n.casefold()]
+        sys.exit(f"no playlist named {args.playlist!r} in the Rekordbox library"
+                 + (f"\n  did you mean: {', '.join(close[:8])}" if close else ""))
+
+    folder = find_folder(pl_root, args.playlist)
+    plan, skipped, missing = build_plan(playlists[args.playlist], tracks, folder)
+    if not plan:
+        sys.exit("nothing to copy: no MP3s found for that playlist")
+
+    have = files_in(folder)
+    todo = [(s, d, z) for s, d, z in plan if not on_disk(have, s, d, z)]
+    stale = extras(have, plan) if args.prune else []
+    need = sum(z for _, _, z in todo)
+    free = shutil.disk_usage(usb).free
+
+    print(f"playlist: {args.playlist}  ->  {folder}")
+    print(f"  {len(plan)} MP3s ({len(plan) - len(todo)} already on stick, {len(todo)} to copy, {fmt_bytes(need)})")
+    for s in skipped:
+        print(f"  skip (not MP3, CDJ-400 can't read): {s.name}")
+    for s in missing:
+        print(f"  MISSING on Mac: {s}")
+    for p in stale:
+        print(f"  remove (no longer in the playlist): {p.name}")
+    if need * 1.05 + (50 << 20) > free:
+        sys.exit(f"NOT ENOUGH SPACE: need ~{fmt_bytes(need)}, stick has {fmt_bytes(free)} free")
+    if not args.execute:
+        print("\ndry run only — pass --execute to copy")
+        return
+
+    folder.mkdir(parents=True, exist_ok=True)
+    done, t0 = 0, time.time()
+    print(f"PROGRESS 0 {need}", flush=True)
+    for src, dest, size in todo:
+        tmp = dest.with_name(dest.name + ".part")
+        shutil.copyfile(src, tmp)        # data only: no xattrs, so no ._ sidecars
+        os.utime(tmp, (src.stat().st_atime, src.stat().st_mtime))
+        os.replace(tmp, dest)
+        done += size
+        rate = done / max(time.time() - t0, 0.01)
+        print(f"PROGRESS {done} {need}  {rate / 1e6:.1f}MB/s  {dest.name}", flush=True)
+
+    have = files_in(folder)
+    bad = [d for s, d, z in plan if not on_disk(have, s, d, z)]
+    if bad:
+        print("\nVERIFY FAILED:")
+        for b in bad[:20]:
+            print("  ", b)
+        sys.exit(1)
+    for p in list(folder.rglob("._*")) + list(pl_root.glob("._*")):
+        p.unlink(missing_ok=True)       # incl. the ._<folder> sidecar macOS puts beside it
+    for p in folder.glob("*.part"):
+        p.unlink(missing_ok=True)
+    for p in stale:
+        p.unlink(missing_ok=True)
+    if stale:
+        print(f"removed {len(stale)} track(s) no longer in the playlist")
+    by = sort_order(folder).get("by")
+    if by and (todo or stale):
+        sys.stdout.flush()
+        subprocess.run([str(SORTER), str(usb), "--by", by, "--folder", folder.name,
+                        "--xml", str(xml), "--execute"], check=False)
+    print(f"\nPlaylists/{folder.name}/ now has {len(plan)} tracks "
+          f"({len(todo)} newly copied) in {time.time() - t0:.0f}s"
+          f" — run: cdj400-usb --check")
+    if missing:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

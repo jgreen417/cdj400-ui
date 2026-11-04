@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>CDJ-400 Sticks</string>
+	<key>CFBundleDisplayName</key>
+	<string>CDJ-400 Sticks</string>
+	<key>CFBundleIdentifier</key>
+	<string>io.github.jgreen417.cdj400sticks</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleExecutable</key>
+	<string>CDJ400UI</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>26.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>Reads the playlists on your CDJ-400 USB sticks and rebuilds them in lean mode.</string>
+</dict>
+</plist>
