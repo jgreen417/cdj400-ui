@@ -1,6 +1,6 @@
 cask "cdj400-sticks" do
   version "0.1.0"
-  sha256 "997de226d5cc9a6aa39789c24246dd83a91a37b2a44cc9a239a3b0f93273bd0a"
+  sha256 "cae48f03ebe6a38744c47776d3346836dd5e00d51afa0dfaf85fd5670ed2fe45"
 
   url "https://github.com/jgreen417/cdj400-ui/releases/download/v#{version}/CDJ-400-Sticks-#{version}.zip"
   name "CDJ-400 Sticks"
