@@ -30,25 +30,36 @@ The app is a front-end. The actual copying, exporting and sorting is done by the
 | ⌘⎋ | Stop the running job |
 | ⇧⌘K | Clear the output |
 
-## Requirements
+## Install
 
-- macOS 26 or later, and Xcode 26 (Swift 6.2 or newer) to build.
-- Rekordbox, plus [pyrekordbox](https://github.com/dylanljones/pyrekordbox) in a virtualenv at `~/venvs/rekordbox`. The tools read the live Rekordbox library through it:
+With [Homebrew](https://brew.sh):
 
-  ```bash
-  python3 -m venv ~/venvs/rekordbox
-  ~/venvs/rekordbox/bin/pip install pyrekordbox
-  ```
+```bash
+brew install --cask jgreen417/tap/cdj400-sticks
+```
 
-The `cdj400-*` tools the app runs live in [`tools/`](tools/README.md), and `build.sh` bundles them into the app. Jobs run through a login `zsh` (`zsh -lc`), so your normal `PATH` applies. Tools that print `PROGRESS <bytes done> <bytes total>` lines drive the progress bar.
+Or download the zip from the [latest release](https://github.com/jgreen417/cdj400-ui/releases/latest), unzip it, and drag **CDJ-400 Sticks** into Applications.
 
-## Build and run
+The app isn't notarized by Apple, so macOS blocks it the first time you open it. Open it once, then go to **System Settings → Privacy & Security** and click **Open Anyway**. You only need to do this once per install.
+
+You need macOS 26 or later, and Rekordbox. To export from your Rekordbox library, the tools also need [pyrekordbox](https://github.com/dylanljones/pyrekordbox) in a virtualenv at `~/venvs/rekordbox`:
+
+```bash
+python3 -m venv ~/venvs/rekordbox
+~/venvs/rekordbox/bin/pip install pyrekordbox
+```
+
+The `cdj400-*` tools the app runs are bundled inside it. Their source is in [`tools/`](tools/README.md), and they also work from the command line.
+
+## Build from source
+
+You need Xcode 26 (Swift 6.2 or newer).
 
 ```bash
 ./build.sh
 ```
 
-This builds a release binary and installs `CDJ-400 Sticks.app` into `~/Applications`. To put it somewhere else, pass a folder: `./build.sh /Applications`.
+This builds the app with its tools bundled and installs it into `~/Applications`. To put it somewhere else, pass a folder: `./build.sh /Applications`. Set `UNIVERSAL=1` to build for both Apple Silicon and Intel.
 
 For development:
 
@@ -61,6 +72,15 @@ CDJ_DEMO=1 swift run
 `CDJ_DEMO=1` replaces the real `/Volumes` scan with three sample sticks, so you can work on the UI without hardware. A bare `swift run` binary has no bundle identifier, so it skips notifications. Use `build.sh` to get those.
 
 The app looks for the tools in `$CDJ400_TOOLS`, then in its own bundle, then in `~/bin`. A bare `swift run` binary has no bundle, so point it at the repo's copy with `CDJ400_TOOLS="$PWD/tools" swift run`.
+
+Jobs run through a login `zsh` (`zsh -lc`), so your normal `PATH` applies. Tools that print `PROGRESS <bytes done> <bytes total>` lines drive the progress bar.
+
+## Releasing
+
+1. Bump `CFBundleShortVersionString` (and `CFBundleVersion`) in `Info.plist`, then commit.
+2. Run `./release.sh`. It runs the tests and builds a universal app. It commits the zip's checksum into [`packaging/cdj400-sticks.rb`](packaging/cdj400-sticks.rb), tags `v<version>`, publishes the GitHub release, and copies the cask into [jgreen417/homebrew-tap](https://github.com/jgreen417/homebrew-tap).
+
+`./release.sh --dry-run` only builds the zip in `dist/`.
 
 ## Project layout
 
@@ -80,6 +100,7 @@ Sources/CDJ400UI/
   Theme.swift           Colors and shared view components
 Tests/CDJ400UITests/    Parsing, shell quoting, output streaming and tool smoke tests
 tools/                  The cdj400-* command-line tools (see tools/README.md)
+packaging/              The Homebrew cask (release.sh fills in version and checksum)
 icon/                   App icon source (make-icon.swift) and the built AppIcon.icns
 ```
 

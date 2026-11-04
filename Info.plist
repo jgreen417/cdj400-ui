@@ -2,20 +2,20 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>CFBundleName</key>
-	<string>CDJ-400 Sticks</string>
 	<key>CFBundleDisplayName</key>
 	<string>CDJ-400 Sticks</string>
-	<key>CFBundleIdentifier</key>
-	<string>io.github.jgreen417.cdj400sticks</string>
-	<key>CFBundleIconFile</key>
-	<string>AppIcon</string>
 	<key>CFBundleExecutable</key>
 	<string>CDJ400UI</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>io.github.jgreen417.cdj400sticks</string>
+	<key>CFBundleName</key>
+	<string>CDJ-400 Sticks</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1</string>
+	<string>0.1.0</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
 	<key>LSMinimumSystemVersion</key>

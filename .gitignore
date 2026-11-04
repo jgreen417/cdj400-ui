@@ -7,3 +7,4 @@ xcuserdata/
 /icon/AppIcon.iconset/
 /icon/icon-1024.png
 __pycache__/
+/dist/
