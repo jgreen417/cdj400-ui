@@ -421,7 +421,10 @@ def main():
     # A Spotlight index makes legacy players chew through thousands of invisible
     # files on first scan: turn indexing off so macOS stops regrowing
     # .Spotlight-V100 (and fresh ._* sidecars) every time the stick is mounted.
+    # `mdutil -i off` alone is forgotten on remount; the marker file is not.
     subprocess.run(["mdutil", "-i", "off", str(usb)], check=False, capture_output=True)
+    (usb / ".metadata_never_index").touch()
+    (usb / "._.metadata_never_index").unlink(missing_ok=True)
     print(f"\nadopted {len(plan)} files into Playlists/ — now run: cdj400-usb --check")
 
 

@@ -37,6 +37,42 @@ private func zsh(_ command: String) async -> (text: String, status: Int32) {
     }
 }
 
+@Suite struct DisableSpotlight {
+    /// A stick folder plus a fake `mdutil` whose `-s` reports `status`, so the
+    /// test never touches real Spotlight settings.
+    private func run(status: String) async throws -> (result: (text: String, status: Int32), stick: URL) {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cdj400-test-\(UUID().uuidString)")
+        let bin = dir.appendingPathComponent("bin"), usb = dir.appendingPathComponent("Josh's USB")
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: usb, withIntermediateDirectories: true)
+        try Data().write(to: usb.appendingPathComponent("._.metadata_never_index"))
+        let fake = bin.appendingPathComponent("mdutil")
+        try "#!/bin/sh\n[ \"$1\" = -s ] && printf '%s:\\n\\t%s\\n' \"$2\" '\(status)'\nexit 0\n"
+            .write(to: fake, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fake.path)
+
+        let command = StickCommands.disableSpotlight(stick: stick(path: usb.path, name: "Josh's USB"))
+        return (await zsh("PATH=\(StickCommands.quote(bin.path)):$PATH; \(command)"), usb)
+    }
+
+    @Test func reportsOffOnlyWhenMdutilConfirmsIt() async throws {
+        let (result, usb) = try await run(status: "Indexing disabled.")
+        defer { try? FileManager.default.removeItem(at: usb.deletingLastPathComponent()) }
+        #expect(result.status == 0)
+        #expect(result.text == "Spotlight indexing is off for Josh's USB\n")
+        #expect(FileManager.default.fileExists(atPath: usb.appendingPathComponent(".metadata_never_index").path))
+        #expect(!FileManager.default.fileExists(atPath: usb.appendingPathComponent("._.metadata_never_index").path))
+    }
+
+    @Test func failsWhenIndexingIsStillOn() async throws {
+        let (result, usb) = try await run(status: "Indexing enabled.")
+        defer { try? FileManager.default.removeItem(at: usb.deletingLastPathComponent()) }
+        #expect(result.status == 1)
+        #expect(result.text.contains("Spotlight is still indexing Josh's USB"))
+    }
+}
+
 @Suite struct VendoredTools {
     /// The tests run with the default lookup, so point at the repo's copy explicitly.
     private let tools = URL(fileURLWithPath: #filePath)

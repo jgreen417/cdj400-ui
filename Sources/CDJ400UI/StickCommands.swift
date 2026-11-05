@@ -64,14 +64,17 @@ enum StickCommands {
             + " && echo \"removed $count sidecar files from \"\(quote(stick.name))"
     }
 
-    /// Spotlight settings need admin rights, so macOS asks for your password.
+    /// Runs as you, not as admin: a root mdutil can't see removable volumes
+    /// without its own privacy grant, and it fails with exit 0 when it can't.
+    /// `mdutil -i off` alone doesn't survive a remount, so the stick also gets
+    /// a `.metadata_never_index` marker. Success is whatever `mdutil -s` says.
     static func disableSpotlight(stick: Stick) -> String {
-        let script = """
-            on run argv
-            do shell script "mdutil -i off " & quoted form of (item 1 of argv) & " && (mdutil -X " & quoted form of (item 1 of argv) & " >/dev/null 2>&1 || true)" with administrator privileges
-            end run
-            """
-        return "osascript -e \(quote(script)) \(quote(stick.path)) && echo \(quote("Spotlight indexing is off for \(stick.name)"))"
+        let path = quote(stick.path)
+        return "mdutil -i off \(path) >/dev/null 2>&1; touch \(path)/.metadata_never_index"
+            + " && rm -f \(path)/._.metadata_never_index"
+            + " && if mdutil -s \(path) | grep -q 'Indexing disabled'; then"
+            + " echo \(quote("Spotlight indexing is off for \(stick.name)"));"
+            + " else echo \(quote("Spotlight is still indexing \(stick.name)")) >&2; exit 1; fi"
     }
 
     static func listAddablePlaylists(stick: Stick) -> String {

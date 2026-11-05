@@ -11,7 +11,7 @@ The app is a front-end. The actual copying, exporting and sorting is done by the
 - **Stick list** in the window sidebar and in the menu bar. It refreshes automatically when a volume mounts or unmounts. Each stick shows its mode, free space, and a warning when something other than this app wrote to it in the last 90 seconds while Rekordbox is open, which usually means it is still syncing.
 - **Health checks** with one-click fixes where possible:
   - `._` sidecar files. Fix: remove them.
-  - Spotlight indexing the stick. Fix: turn it off. This asks for your password.
+  - Spotlight indexing the stick. Fix: turn it off, which also leaves a `.metadata_never_index` marker so it stays off.
   - Non-MP3 audio the deck can't play.
   - Less than 10% free space.
   - A file system other than FAT32.

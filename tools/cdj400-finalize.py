@@ -100,8 +100,11 @@ def purge_apple_junk(usb: Path):
     for junk in (".Spotlight-V100", ".fseventsd", ".Trashes",
                  "System Volume Information"):
         shutil.rmtree(usb / junk, ignore_errors=True)
+    # `mdutil -i off` alone is forgotten on remount; the marker file is not.
     subprocess.run(["mdutil", "-i", "off", str(usb)],
                    capture_output=True, check=False)
+    (usb / ".metadata_never_index").touch()
+    (usb / "._.metadata_never_index").unlink(missing_ok=True)
     leftovers = sum(1 for _ in usb.rglob("._*"))
     print(f"apple junk purged, ._* remaining: {leftovers}")
 

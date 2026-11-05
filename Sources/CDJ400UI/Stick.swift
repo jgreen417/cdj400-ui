@@ -84,7 +84,7 @@ enum StickIssue: Hashable, Identifiable, Sendable {
         case .nearlyFull:
             "Less than 10% free. Remove a playlist or use a bigger stick."
         case .spotlightIndex:
-            "Spotlight keeps writing to this stick and regrows sidecars. Turning it off asks for your Mac password."
+            "Spotlight keeps writing to this stick and regrows sidecars. Turning it off also marks the stick so it stays off on any Mac."
         case .notFAT:
             "The CDJ-400 only reads FAT32 sticks. Reformat it as MS-DOS (FAT) in Disk Utility."
         }
