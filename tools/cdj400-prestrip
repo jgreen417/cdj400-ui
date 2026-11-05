@@ -37,7 +37,8 @@ if [ ! -d "$USB/PIONEER" ] && [ ! -d "$USB/Contents" ]; then
   echo "$NAME: nothing to prestrip (no PIONEER/ or Contents/)"; exit 0
 fi
 # Refuse to touch a stick that is being written right now (Sync Manager mid-export).
-if [ "${CDJ400_FORCE:-}" != "1" ]; then
+# With Rekordbox closed nothing is left to write, so the check is skipped.
+if [ "${CDJ400_FORCE:-}" != "1" ] && pgrep -qf '/rekordbox.app/Contents/'; then
   HOT="$(find "$USB/PIONEER" "$USB/Contents" -type f \
          -newermt "$(date -v-90S '+%Y-%m-%d %H:%M:%S')" 2>/dev/null | head -n 1 || true)"
   if [ -n "$HOT" ]; then

@@ -319,9 +319,13 @@ def main():
 
     # Refuse to mutate a stick that is being written right now. Rekordbox Sync
     # Manager holds the stick open while exporting, and moving files under a
-    # live export corrupts it. Dry runs are read-only and skip this check.
-    if subprocess.run(["printenv", "CDJ400_FORCE"], capture_output=True,
-                      text=True).stdout.strip() != "1":
+    # live export corrupts it. Dry runs are read-only and skip this check, and
+    # so does a run with Rekordbox closed: nothing else is left to write.
+    rekordbox_running = subprocess.run(
+        ["pgrep", "-qf", "/rekordbox.app/Contents/"]).returncode == 0
+    if rekordbox_running and subprocess.run(
+            ["printenv", "CDJ400_FORCE"], capture_output=True,
+            text=True).stdout.strip() != "1":
         cutoff = subprocess.run(["date", "-v-90S", "+%Y-%m-%d %H:%M:%S"],
                                 capture_output=True, text=True).stdout.strip()
         hot = ""

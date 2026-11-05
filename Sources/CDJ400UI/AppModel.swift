@@ -109,12 +109,20 @@ final class AppModel: ObservableObject {
     /// True when something other than this app wrote to the stick in the last
     /// 90 seconds, which usually means Rekordbox is syncing it. The app's own
     /// jobs don't count; macOS keeps touching the stick's housekeeping files
-    /// for a little while after a write, hence the grace period.
+    /// for a little while after a write, hence the grace period. With Rekordbox
+    /// closed nothing is left to write, so there's nothing to warn about.
     func changedOutsideApp(_ stick: Stick) -> Bool {
         guard stick.isRecentlyChanged, let changed = stick.lastChange else { return false }
+        guard Self.rekordboxRunning else { return false }
         if writing.contains(stick.path) { return false }
         if let ours = lastAppWrite[stick.path], changed <= ours.addingTimeInterval(30) { return false }
         return true
+    }
+
+    private static var rekordboxRunning: Bool {
+        NSWorkspace.shared.runningApplications.contains {
+            $0.bundleURL?.path.contains("/rekordbox.app") ?? false
+        }
     }
 
     /// Sticks a lean stick's playlists can be copied onto.

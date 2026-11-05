@@ -124,9 +124,16 @@ def forced() -> bool:
                           text=True).stdout.strip() == "1"
 
 
+def rekordbox_running() -> bool:
+    return subprocess.run(["pgrep", "-qf", "/rekordbox.app/Contents/"]).returncode == 0
+
+
 def recent_write(usb: Path, secs: int = 90):
-    """First file written to the stick within `secs`, else None. A hit means
-    Rekordbox is very likely mid-export — never mutate the stick then."""
+    """First file written to the stick within `secs`, else None. A hit while
+    Rekordbox is open means it is very likely mid-export — never mutate the
+    stick then. With Rekordbox closed nothing is left to write, so no hit."""
+    if not rekordbox_running():
+        return None
     cutoff = time.time() - secs
     for part in ("PIONEER", "Contents"):
         d = usb / part

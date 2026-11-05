@@ -43,5 +43,5 @@ The tools find each other by their own folder, so keep them together.
 
 | Variable | Effect |
 | --- | --- |
-| `CDJ400_FORCE=1` | Skips the "this stick was written in the last 90 seconds" safety check |
+| `CDJ400_FORCE=1` | Skips the "this stick was written in the last 90 seconds" safety check (already skipped when Rekordbox is closed) |
 | `CDJ400_STICKS` | Space-separated mount points for `cdj400-usb` to finish, instead of every plugged-in stick |
