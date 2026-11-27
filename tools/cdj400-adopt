@@ -36,12 +36,27 @@ Before PIONEER/ is deleted, its device DBs + sync manifest are copied to
 ~/Music/DJ.USB-DEVICEDBS/<stick>-<date>/ so "what playlists lived on this
 stick" stays answerable (the .sync file is plain XML; export.pdb is DeviceSQL).
 
+Restore backup: before anything on the stick changes, --execute copies
+PIONEER/ and every Contents/ file that no playlist uses to
+~/Music/DJ.CDJ400-BACKUPS/<stick>-<stamp>/, with restore-map.json recording
+where each moved file came from. cdj400-restore uses it to move the files
+back (instant, no copying) and put PIONEER/ back, so the stick returns to
+exactly the export Rekordbox made. Playlists/.cdj400-lean.json names that
+backup, so a restore can never pick up an older one or another stick's.
+
+--tidy-names names files "Artist - Title.mp3" from Rekordbox's metadata (easy
+to read on the CDJ-400's screen); each folder's .cdj400-order.json keeps the
+Mac names so the other tools still match every track.
+
 Usage:
   cdj400-adopt <rekordbox.xml> <usb-mount>            # dry run
   cdj400-adopt <rekordbox.xml> <usb-mount> --execute  # perform
   cdj400-adopt <rekordbox.xml> <usb-mount> --resume   # finish/repair
+  ... --tidy-names                                    # "Artist - Title" file names
 """
 import argparse
+import json
+import os
 import re
 import shutil
 import subprocess
@@ -52,9 +67,16 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 import xml.etree.ElementTree as ET
 
+HERE = Path(__file__).resolve().parent  # sibling cdj400-* tools live here
+sys.dont_write_bytecode = True          # never write __pycache__ into the app bundle
+sys.path.insert(0, str(HERE))
+from cdj400_names import OrderFile, tidy_name, unique  # noqa: E402
+
 JUNK = [".Spotlight-V100", ".fseventsd", ".Trashes", ".TemporaryItems",
         "System Volume Information"]
 DEVICEDB_HOME = Path.home() / "Music/DJ.USB-DEVICEDBS"
+BACKUPS = Path.home() / "Music/DJ.CDJ400-BACKUPS"
+LEAN_MARKER = ".cdj400-lean.json"   # in Playlists/: which backup restores this stick
 RB_DB = Path.home() / "Library/Pioneer/rekordbox/master.db"
 STALE_GRACE = 1800  # seconds the XML may trail the library before we complain
 
@@ -131,6 +153,107 @@ def rmrf(path):
     subprocess.run(["rm", "-rf", str(path)], check=False, capture_output=True)
 
 
+def size_of(path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return -1
+
+
+def volume_uuid(usb):
+    """The volume's UUID from diskutil, or None. Two sticks can share a name;
+    this tells their backups apart."""
+    import plistlib
+    try:
+        out = subprocess.run(["diskutil", "info", "-plist", str(usb)],
+                             capture_output=True, timeout=20).stdout
+        return plistlib.loads(out).get("VolumeUUID") or None
+    except Exception:  # noqa: BLE001 — no diskutil, not a volume, bad plist
+        return None
+
+
+def tree_files(root):
+    """Every regular file under root, skipping ._ sidecars."""
+    found = []
+    for dirpath, _, names in os.walk(root):
+        for n in names:
+            if not n.startswith("._"):
+                found.append(Path(dirpath) / n)
+    return found
+
+
+def make_backup(usb, moves, uuid, stamp):
+    """Copy PIONEER/ and the Contents/ files no playlist uses to the Mac, and
+    record where every moved file came from. Nothing on the stick changes."""
+    contents = usb / "Contents"
+    moved = {str(e["src"]) for e in moves}
+    kept = [p for p in tree_files(contents) if str(p) not in moved] if contents.is_dir() else []
+    pioneer = tree_files(usb / "PIONEER") if (usb / "PIONEER").is_dir() else []
+    need = sum(max(size_of(p), 0) for p in kept + pioneer)
+    BACKUPS.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(BACKUPS).free
+    if need * 1.05 + (200 << 20) > free:
+        sys.exit(f"NOT ENOUGH SPACE ON THE MAC for the restore backup: need "
+                 f"~{need / 1e9:.1f} GB, have {free / 1e9:.1f} GB free — stick untouched")
+    dest = BACKUPS / f"{usb.name}-{stamp}"
+    n = 0
+    while dest.exists():           # never merge two runs into one backup dir
+        n += 1
+        dest = BACKUPS / f"{usb.name}-{stamp}-{n}"
+    dest.mkdir(parents=True)
+    print(f"backing up for Restore: {len(pioneer)} PIONEER files + {len(kept)} unused "
+          f"Contents files ({need / 1e9:.2f} GB) -> {dest}", flush=True)
+    if pioneer:
+        subprocess.run(["rsync", "-a", str(usb / "PIONEER") + "/", str(dest / "PIONEER") + "/"],
+                       check=True)
+    for p in kept:
+        target = dest / p.relative_to(usb)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(p, target)       # data only: Contents/ comes back via rsync
+    bad = [p for p in pioneer + kept
+           if size_of(dest / p.relative_to(usb)) != size_of(p)]
+    if bad:
+        sys.exit(f"backup verify FAILED ({len(bad)} files differ, e.g. {bad[0]}) — "
+                 f"stick untouched; backup left at {dest}")
+    journal = {
+        "version": 2,
+        "stick": usb.name,
+        "volume_uuid": uuid,
+        "made": stamp,
+        "moves": [{"contents": str(e["src"].relative_to(usb)), "mac_name": e["name"],
+                   "mac": str(e["mac"]), "size": e["size"]} for e in moves],
+        "kept": [str(p.relative_to(usb)) for p in kept],
+        "pioneer_files": len(pioneer),
+    }
+    (dest / "restore-map.json").write_text(json.dumps(journal, ensure_ascii=False, indent=1))
+    (dest / ".complete").write_text(
+        f"stick={usb.name}\nparts=PIONEER,Contents(unused)\nfiles={len(pioneer) + len(kept)}\n"
+        f"written={stamp}\nkind=adopt\n")
+    return dest
+
+
+def prune_backups(usb, keep, uuid):
+    """Drop this stick's older adopt backups: the stick's marker only ever
+    points at the newest. Only backups that recorded the same volume UUID go,
+    so a different stick with the same name keeps its own."""
+    if not uuid:
+        return
+    for old in sorted(BACKUPS.glob(f"{glob_escape(usb.name)}-*")):
+        if old == keep or not old.is_dir():
+            continue
+        try:
+            journal = json.loads((old / "restore-map.json").read_text())
+        except (OSError, ValueError):
+            continue                     # older-style backup: leave it alone
+        if journal.get("volume_uuid") == uuid:
+            print(f"  pruning older restore backup: {old.name}")
+            shutil.rmtree(old, ignore_errors=True)
+
+
+def glob_escape(text):
+    return re.sub(r"([*?\[])", r"[\1]", text)
+
+
 def stash_device_dbs(usb):
     """Keep the stick's device DB + sync manifest on the Mac before the strip
     deletes them — they record which playlists were synced to that stick."""
@@ -163,6 +286,8 @@ def main():
                          "fix missing/wrong ones, then verify + clean up")
     ap.add_argument("--force", action="store_true",
                     help="skip the stale-XML warning pause")
+    ap.add_argument("--tidy-names", action="store_true",
+                    help='name files "Artist - Title" from Rekordbox metadata')
     ap.add_argument("--skip-over", type=int, default=500)
     ap.add_argument("--min-prefix", type=int, default=16)
     args = ap.parse_args()
@@ -185,6 +310,8 @@ def main():
         tracks[tr.get("TrackID")] = {
             "path": mac_path(tr.get("Location")),
             "size": int(tr.get("Size") or 0),
+            "artist": tr.get("Artist") or "",
+            "title": tr.get("Name") or "",
         }
     playlists = []
     for node in root.find("PLAYLISTS").iter("NODE"):
@@ -238,7 +365,7 @@ def main():
         cands = index.get(n, [])
         if cands:
             if size:
-                sized = [c for c in cands if c.stat().st_size == size]
+                sized = [c for c in cands if size_of(c) == size]
                 if sized:
                     return sized[0], "exact"
             else:
@@ -253,7 +380,7 @@ def main():
         if not pref:
             return None, "missing"
         if size:
-            sized = [c for c in pref if c.stat().st_size == size]
+            sized = [c for c in pref if size_of(c) == size]
             if sized:
                 return sized[0], "prefix+size"
             return None, "size-mismatch"
@@ -267,7 +394,7 @@ def main():
     missing, ambiguous = [], []
 
     for pl, refs in playlists:
-        seen = set()
+        seen, taken = set(), set()
         for key in refs:
             t = tracks.get(key)
             if not t or not t["path"]:
@@ -284,23 +411,27 @@ def main():
             if src is None and how.startswith("ambiguous"):
                 ambiguous.append((pl, m.name, how))
                 continue
+            # dest: the name on the stick. "Artist - Title" with --tidy-names,
+            # else the Mac name; "(2)" when two tracks would share a name.
+            wanted = tidy_name(t["artist"], t["title"], m.name) if args.tidy_names else m.name
+            dest = unique(wanted, taken)
             if src is None:
-                plan.append(dict(pl=pl, name=m.name, size=size, mac=m,
+                plan.append(dict(pl=pl, name=m.name, dest=dest, size=size, mac=m,
                                  kind="maccopy"))
                 stats["maccopy"] += 1
             elif src in owner_of:
-                plan.append(dict(pl=pl, name=m.name, size=size, mac=m,
+                plan.append(dict(pl=pl, name=m.name, dest=dest, size=size, mac=m,
                                  kind="stickcopy", owner=owner_of[src]))
                 stats["stickcopy"] += 1
             else:
-                owner_of[src] = (pl, m.name)
-                plan.append(dict(pl=pl, name=m.name, size=size, mac=m,
+                owner_of[src] = (pl, dest)
+                plan.append(dict(pl=pl, name=m.name, dest=dest, size=size, mac=m,
                                  kind="move", src=src))
                 stats["move"] += 1
 
     used = set(owner_of)
     leftover = [p for v in index.values() for p in v if p not in used]
-    leftover_gb = sum(p.stat().st_size for p in leftover if p.exists()) / 1e9
+    leftover_gb = sum(max(size_of(p), 0) for p in leftover) / 1e9
 
     print(f"XML playlists: {len(playlists)} | refs planned: {len(plan)}")
     print(f"  moves (instant renames):   {stats['move']}")
@@ -310,7 +441,15 @@ def main():
         print("  MISSING:", x)
     for x in ambiguous:
         print("  AMBIGUOUS:", x)
-    print(f"  leftover Contents to delete: {len(leftover)} files / {leftover_gb:.2f} GB")
+    print(f"  leftover Contents to delete: {len(leftover)} files / {leftover_gb:.2f} GB"
+          " (backed up to the Mac first, for Restore)")
+    renamed = [e for e in plan if e["dest"] != e["name"]]
+    if args.tidy_names:
+        print(f'  file names: "Artist - Title" ({len(renamed)} of {len(plan)} renamed)')
+        for e in renamed[:15]:
+            print(f"    {e['name']}\n      -> {e['dest']}")
+        if len(renamed) > 15:
+            print(f"    … and {len(renamed) - 15} more")
 
     if not (args.execute or args.resume):
         print("\ndry run only — pass --execute to perform "
@@ -319,9 +458,13 @@ def main():
 
     # Refuse to mutate a stick that is being written right now. Rekordbox Sync
     # Manager holds the stick open while exporting, and moving files under a
-    # live export corrupts it. Dry runs are read-only and skip this check.
-    if subprocess.run(["printenv", "CDJ400_FORCE"], capture_output=True,
-                      text=True).stdout.strip() != "1":
+    # live export corrupts it. Dry runs are read-only and skip this check, and
+    # so does a run with Rekordbox closed: nothing else is left to write.
+    rekordbox_running = subprocess.run(
+        ["pgrep", "-qf", "/rekordbox.app/Contents/"]).returncode == 0
+    if rekordbox_running and subprocess.run(
+            ["printenv", "CDJ400_FORCE"], capture_output=True,
+            text=True).stdout.strip() != "1":
         cutoff = subprocess.run(["date", "-v-90S", "+%Y-%m-%d %H:%M:%S"],
                                 capture_output=True, text=True).stdout.strip()
         hot = ""
@@ -342,10 +485,30 @@ def main():
             print("   with CDJ400_FORCE=1 if you know it has finished.")
             sys.exit(1)
 
+    # Back up for Restore before the stick changes. A --resume reuses the
+    # backup the interrupted run made, which recorded the untouched export.
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    uuid = volume_uuid(usb)
+    marker = pl_root / LEAN_MARKER
+    backup = None
+    if args.resume:
+        try:
+            named = json.loads(marker.read_text()).get("backup")
+            if named and (BACKUPS / named / ".complete").is_file():
+                backup = BACKUPS / named
+                print(f"\n--resume: using the restore backup from the first run: {backup}")
+        except (OSError, ValueError):
+            pass
+    if backup is None:
+        backup = make_backup(usb, [e for e in plan if e["kind"] == "move"], uuid, stamp)
+
     if args.execute:
         rmtree_force(pl_root)  # wipe any partial render from a crashed run
     else:
         print("\n--resume: keeping existing Playlists/, repairing missing/wrong entries")
+    pl_root.mkdir(exist_ok=True)
+    marker.write_text(json.dumps({"backup": backup.name, "volume_uuid": uuid,
+                                  "made": stamp}, indent=1))
 
     # what's already in Playlists/ (name+size) — donors for dupes + repairs
     have = {}
@@ -354,7 +517,7 @@ def main():
             have.setdefault((norm(p.name), p.stat().st_size), []).append(p)
 
     def donor_for(e, dest):
-        for p in have.get((norm(e["name"]), e["size"]), []):
+        for p in have.get((norm(e["dest"]), e["size"]), []):
             if p != dest and p.exists():
                 return p
         return None
@@ -362,7 +525,7 @@ def main():
     fixed = kept = 0
     failures = []
     for e in plan:
-        dest = pl_root / e["pl"] / e["name"]
+        dest = pl_root / e["pl"] / e["dest"]
         if dest.exists():
             if dest.stat().st_size == e["size"]:
                 kept += 1
@@ -381,14 +544,13 @@ def main():
                 shutil.copyfile(owner_dest if owner_dest.exists() else e["mac"], dest)
             else:  # maccopy, or a move whose source was consumed earlier
                 shutil.copyfile(e["mac"], dest)
-            have.setdefault((norm(e["name"]), e["size"]), []).append(dest)
+            have.setdefault((norm(e["dest"]), e["size"]), []).append(dest)
         except Exception as exc:  # noqa: BLE001
             failures.append(f"{dest} — {type(exc).__name__}: {exc}")
 
-    bad = [f"{pl_root / e['pl'] / e['name']}"
+    bad = [f"{pl_root / e['pl'] / e['dest']}"
            for e in plan
-           if not (pl_root / e["pl"] / e["name"]).exists()
-           or (pl_root / e["pl"] / e["name"]).stat().st_size != e["size"]]
+           if size_of(pl_root / e["pl"] / e["dest"]) != e["size"]]
     if bad:
         print("\nVERIFY FAILED — nothing deleted; investigate:")
         for b in bad[:20]:
@@ -399,6 +561,15 @@ def main():
 
     print(f"verify OK: {len(plan)} files present with correct bytes "
           f"({kept} kept, {fixed} replaced)")
+    # Record each folder's naming, and the Mac name of every renamed file, so
+    # Check / Update, Sort and cdj400-rename still recognise every track.
+    for pl in {e["pl"] for e in plan}:
+        order = OrderFile(pl_root / pl)
+        order.names = "tidy" if args.tidy_names else "original"
+        order.by = None
+        order.prefixed = set()
+        order.original = {e["dest"]: e["name"] for e in plan if e["pl"] == pl}
+        order.save()
     stash_device_dbs(usb)
     for target in [usb / "PIONEER", usb / "Contents"]:
         if target.exists():
@@ -417,8 +588,13 @@ def main():
     # A Spotlight index makes legacy players chew through thousands of invisible
     # files on first scan: turn indexing off so macOS stops regrowing
     # .Spotlight-V100 (and fresh ._* sidecars) every time the stick is mounted.
+    # `mdutil -i off` alone is forgotten on remount; the marker file is not.
     subprocess.run(["mdutil", "-i", "off", str(usb)], check=False, capture_output=True)
+    (usb / ".metadata_never_index").touch()
+    (usb / "._.metadata_never_index").unlink(missing_ok=True)
+    prune_backups(usb, backup, uuid)
     print(f"\nadopted {len(plan)} files into Playlists/ — now run: cdj400-usb --check")
+    print(f"Restore to Rekordbox will use: {backup}")
 
 
 if __name__ == "__main__":

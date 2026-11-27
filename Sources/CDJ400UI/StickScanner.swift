@@ -31,6 +31,7 @@ enum StickScanner {
         let inContents = mode == .full ? FileTally(walking: contents) : nil
         let folders = inPlaylists.map { folderList(in: playlists, tally: $0) } ?? []
         let volume = volumeInfo(path: root.path)
+        let example = hasPlaylists ? nameExample(in: playlists, folders: folders) : nil
 
         return Stick(
             path: root.path,
@@ -44,7 +45,10 @@ enum StickScanner {
             lastChange: newestModification(in: root),
             fileSystem: volume.fileSystem,
             unplayable: inPlaylists?.otherAudio ?? 0,
-            spotlightIndexing: isSpotlightIndexing(path: root.path)
+            spotlightIndexing: isSpotlightIndexing(path: root.path),
+            exportBytes: inContents?.bytes ?? 0,
+            restoreBackupDate: hasPlaylists ? restoreBackupDate(in: playlists) : nil,
+            nameExample: example
         )
     }
 
@@ -55,24 +59,30 @@ enum StickScanner {
         var mp3s = 0
         var otherAudio = 0
         var sidecars = 0
+        /// Every file's size, sidecars aside.
+        var bytes: Int64 = 0
         /// MP3 names without extension, keyed by the top-level folder they're in.
         var tracksByFolder: [String: [String]] = [:]
+        var bytesByFolder: [String: Int64] = [:]
 
         init(walking directory: URL) {
             guard let walker = FileManager.default.enumerator(
-                at: directory, includingPropertiesForKeys: nil) else { return }
+                at: directory, includingPropertiesForKeys: [.fileSizeKey]) else { return }
             let depth = directory.pathComponents.count
             for case let url as URL in walker {
                 if url.lastPathComponent.hasPrefix("._") {
                     sidecars += 1
                     continue
                 }
+                let size = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+                bytes += size
                 let ext = url.pathExtension.lowercased()
                 if ext == "mp3" {
                     mp3s += 1
                     let parts = url.pathComponents
                     if parts.count > depth + 1 {
                         tracksByFolder[parts[depth], default: []].append(url.deletingPathExtension().lastPathComponent)
+                        bytesByFolder[parts[depth], default: 0] += size
                     }
                 } else if Self.otherAudio.contains(ext) {
                     otherAudio += 1
@@ -90,8 +100,13 @@ enum StickScanner {
             guard fm.fileExists(atPath: directory.path, isDirectory: &isDirectory),
                   isDirectory.boolValue else { return nil }
             let order = sortOrder(in: directory)
-            let tracks = (tally.tracksByFolder[name] ?? []).sorted().map { order.original[$0] ?? $0 }
-            return Playlist(name: name, tracks: tracks.count, trackNames: tracks, sortedBy: order.by)
+            // What the deck shows: the file name without any "001 - " sort prefix.
+            let tracks = (tally.tracksByFolder[name] ?? []).sorted().map {
+                order.prefixed.contains($0) ? stripSortPrefix($0) : $0
+            }
+            return Playlist(name: name, tracks: tracks.count, trackNames: tracks,
+                            sortedBy: order.by, tidyNames: order.tidy,
+                            bytes: tally.bytesByFolder[name] ?? 0)
         }
     }
 
@@ -108,18 +123,62 @@ enum StickScanner {
                 fileSystem)
     }
 
-    /// What cdj400-sort left in `.cdj400-order.json`: the order and each
-    /// prefixed file's original name (both without the .mp3 extension).
-    private static func sortOrder(in directory: URL) -> (by: SortOrder?, original: [String: String]) {
-        struct File: Decodable {
-            let by: String
-            let original: [String: String]
+    /// What the tools left in `.cdj400-order.json` (see tools/cdj400_names.py):
+    /// how the folder is sorted, whether its names are "Artist - Title", and
+    /// which files carry a "001 - " sort prefix (without the .mp3 extension).
+    static func sortOrder(in directory: URL) -> (by: SortOrder?, tidy: Bool, prefixed: Set<String>) {
+        guard let data = try? Data(contentsOf: directory.appendingPathComponent(".cdj400-order.json")) else {
+            return (nil, false, [])
         }
-        guard let data = try? Data(contentsOf: directory.appendingPathComponent(".cdj400-order.json")),
-              let file = try? JSONDecoder().decode(File.self, from: data) else { return (nil, [:]) }
+        return parseOrderFile(data)
+    }
+
+    static func parseOrderFile(_ data: Data) -> (by: SortOrder?, tidy: Bool, prefixed: Set<String>) {
+        struct File: Decodable {
+            let by: String?
+            let names: String?
+            let original: [String: String]?
+            let prefixed: [String]?
+        }
+        guard let file = try? JSONDecoder().decode(File.self, from: data) else { return (nil, false, []) }
         let stem = { (name: String) in (name as NSString).deletingPathExtension }
-        return (SortOrder(rawValue: file.by),
-                Dictionary(file.original.map { (stem($0.key), stem($0.value)) }, uniquingKeysWith: { a, _ in a }))
+        let by = file.by.flatMap(SortOrder.init(rawValue:))
+        // Older cdj400-sort files have no "prefixed": every renamed file was prefixed.
+        let prefixed = file.prefixed ?? (by == .bpm || by == .key ? Array((file.original ?? [:]).keys) : [])
+        return (by, file.names == "tidy", Set(prefixed.map(stem)))
+    }
+
+    /// One file a tidy folder renamed, for the File Names row.
+    private static func nameExample(in playlists: URL, folders: [Playlist]) -> NameExample? {
+        struct File: Decodable { let original: [String: String]? }
+        for folder in folders where folder.tidyNames {
+            let url = playlists.appendingPathComponent(folder.name).appendingPathComponent(".cdj400-order.json")
+            guard let data = try? Data(contentsOf: url),
+                  let file = try? JSONDecoder().decode(File.self, from: data) else { continue }
+            let stem = { (name: String) in (name as NSString).deletingPathExtension }
+            if let pair = (file.original ?? [:]).sorted(by: { $0.key < $1.key })
+                .first(where: { stem(stripSortPrefix($0.key)) != stem($0.value) }) {
+                return NameExample(mac: pair.value, shown: stem(stripSortPrefix(pair.key)))
+            }
+        }
+        return nil
+    }
+
+    /// When Make Lean made the backup this stick restores from, read from the
+    /// stamp in Playlists/.cdj400-lean.json ("20261127-154000").
+    private static func restoreBackupDate(in playlists: URL) -> Date? {
+        struct Marker: Decodable { let made: String? }
+        guard let data = try? Data(contentsOf: playlists.appendingPathComponent(".cdj400-lean.json")),
+              let made = (try? JSONDecoder().decode(Marker.self, from: data))?.made else { return nil }
+        let format = DateFormatter()
+        format.locale = Locale(identifier: "en_US_POSIX")
+        format.dateFormat = "yyyyMMdd-HHmmss"
+        return format.date(from: made)
+    }
+
+    static func stripSortPrefix(_ name: String) -> String {
+        guard let range = name.range(of: #"^\d{3} - "#, options: .regularExpression) else { return name }
+        return String(name[range.upperBound...])
     }
 
     /// Asks Spotlight itself, as `cdj400-usb --check` does. A leftover
@@ -152,24 +211,27 @@ enum StickScanner {
     private static let demoSticks: [Stick] = [
         Stick(path: "/Volumes/DECK A", name: "DECK A", mode: .lean,
               playlists: [
-                  Playlist(name: "Warmup Grooves", tracks: 42,
-                           trackNames: ["Sunrise Dub", "Late Bus Home", "Tidal"]),
+                  Playlist(name: "Acapellas & Tools", tracks: 15,
+                           trackNames: ["Vox Loop 1", "Kick Tool"], tidyNames: true, bytes: 1_000_000_000),
+                  Playlist(name: "Closing Set", tracks: 23,
+                           trackNames: ["Last Call", "Lights Up"], tidyNames: true, bytes: 2_100_000_000),
+                  Playlist(name: "Disco Edits", tracks: 67,
+                           trackNames: ["Mirrorball", "Night Shift"], tidyNames: true, bytes: 5_600_000_000),
                   Playlist(name: "Peak Time Techno", tracks: 118,
                            trackNames: ["Pressure Drop", "Warehouse 9", "Sunrise Edit"],
-                           sortedBy: .bpm),
-                  Playlist(name: "Disco Edits", tracks: 67,
-                           trackNames: ["Mirrorball", "Night Shift"]),
-                  Playlist(name: "Closing Set", tracks: 23,
-                           trackNames: ["Last Call", "Lights Up"]),
-                  Playlist(name: "Acapellas & Tools", tracks: 15,
-                           trackNames: ["Vox Loop 1", "Kick Tool"]),
+                           sortedBy: .bpm, tidyNames: true, bytes: 10_200_000_000),
+                  Playlist(name: "Warmup Grooves", tracks: 42,
+                           trackNames: ["Sunrise Dub", "Late Bus Home", "Tidal"],
+                           sortedBy: .key, tidyNames: true, bytes: 3_600_000_000),
               ],
               tracks: 265, sidecars: 0,
-              freeBytes: 9_400_000_000, totalBytes: 31_900_000_000, lastChange: nil),
+              freeBytes: 9_400_000_000, totalBytes: 31_900_000_000, lastChange: nil,
+              restoreBackupDate: Date(timeIntervalSinceNow: -3 * 3600),
+              nameExample: NameExample(mac: "track02_final_MASTER.mp3", shown: "Ricardo Villalobos - Dexter")),
         Stick(path: "/Volumes/DECK B", name: "DECK B", mode: .full,
               playlists: [], tracks: 812, sidecars: 14,
-              freeBytes: 1_400_000_000, totalBytes: 15_900_000_000, lastChange: Date(),
-              spotlightIndexing: true),
+              freeBytes: 1_400_000_000, totalBytes: 15_900_000_000, lastChange: nil,
+              spotlightIndexing: true, exportBytes: 14_300_000_000),
         Stick(path: "/Volumes/SPARE", name: "SPARE", mode: .lean,
               playlists: [], tracks: 0, sidecars: 0,
               freeBytes: 7_700_000_000, totalBytes: 7_900_000_000, lastChange: nil),

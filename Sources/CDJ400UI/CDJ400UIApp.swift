@@ -12,6 +12,13 @@ struct CDJ400UIApp: App {
         }
         .windowResizability(.contentMinSize)
 
+        Window("Restore Backups", id: "backups") {
+            BackupsView()
+                .environmentObject(model)
+                .frame(minWidth: 680, minHeight: 420)
+        }
+        .defaultSize(width: 820, height: 600)
+
         MenuBarExtra("CDJ-400 Sticks", systemImage: "externaldrive") {
             MenuBarContent()
                 .environmentObject(model)
@@ -45,6 +52,10 @@ struct MenuBarContent: View {
         }
         Divider()
         Button("Open CDJ-400 Sticks") { show(nil) }
+        Button("Restore Backups…", systemImage: "archivebox") {
+            openWindow(id: "backups")
+            NSApplication.shared.activate(ignoringOtherApps: true)
+        }
         Button("Refresh", systemImage: "arrow.clockwise") { model.refresh() }
         Divider()
         Button("Quit") { NSApplication.shared.terminate(nil) }

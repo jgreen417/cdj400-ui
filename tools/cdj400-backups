@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""cdj400-backups — list and delete the restore backups in ~/Music/DJ.CDJ400-BACKUPS.
+
+Usage:
+  cdj400-backups --list                          # one tab-separated line per backup
+  cdj400-backups --delete NAME [NAME ...]        # dry run
+  cdj400-backups --delete NAME [NAME ...] --execute
+
+--list prints: name, stick, made (Unix time, 0 if unknown), bytes, kind, status, volume UUID
+  kind    lean     made by Make Lean (PIONEER/ + unused Contents/ + restore-map.json)
+          full     older-style: all of PIONEER/ and Contents/ (cdj400-finalize --lean, cdj400-prestrip)
+          partial  no .complete marker: an interrupted backup
+  status  in-use      a plugged-in lean stick restores from it
+          latest      the newest backup for a stick that isn't plugged in: keep it
+                      if you might restore that stick
+          older       a newer backup exists for the same stick
+          not-needed  that stick is plugged in and already in Rekordbox mode
+          incomplete  interrupted, can't be restored from
+
+Sticks are read from /Volumes ($CDJ400_VOLUMES overrides it). A backup that
+a plugged-in stick restores from is never deleted, even with --execute; nor is
+anything outside the backups folder.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import plistlib
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+BACKUPS = Path.home() / "Music/DJ.CDJ400-BACKUPS"
+LEAN_MARKER = ".cdj400-lean.json"
+STAMP = re.compile(r"^(?P<stick>.+)-(?P<stamp>\d{8}-\d{6})(?:-\d+)?$")
+LEGACY_WINDOW = 24 * 3600   # same rule cdj400-restore uses for older-style backups
+
+
+def volumes_root() -> Path:
+    return Path(os.environ.get("CDJ400_VOLUMES") or "/Volumes")
+
+
+def volume_uuid(usb: Path):
+    try:
+        out = subprocess.run(["diskutil", "info", "-plist", str(usb)],
+                             capture_output=True, timeout=20).stdout
+        return plistlib.loads(out).get("VolumeUUID") or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def tree_bytes(root: Path) -> int:
+    total = 0
+    for dirpath, _, names in os.walk(root):
+        for n in names:
+            try:
+                total += (Path(dirpath) / n).lstat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def read_backup(path: Path) -> dict:
+    m = STAMP.match(path.name)
+    stick = m.group("stick") if m else path.name
+    made = 0
+    if m:
+        try:
+            made = int(time.mktime(time.strptime(m.group("stamp"), "%Y%m%d-%H%M%S")))
+        except ValueError:
+            made = 0
+    if not made:
+        made = int(path.stat().st_mtime)
+    uuid, kind = None, "full"
+    journal = path / "restore-map.json"
+    if journal.is_file():
+        kind = "lean"
+        try:
+            data = json.loads(journal.read_text())
+            uuid = data.get("volume_uuid") or None
+            stick = data.get("stick") or stick
+        except ValueError:
+            pass
+    if not (path / ".complete").is_file():
+        kind = "partial"
+    return dict(name=path.name, path=path, stick=stick, made=made, uuid=uuid, kind=kind,
+                bytes=tree_bytes(path))
+
+
+def plugged_in() -> list:
+    """[{name, path, uuid, lean, marker}] for every stick-looking volume."""
+    found = []
+    root = volumes_root()
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        return found
+    for usb in entries:
+        try:
+            lean = (usb / "Playlists").is_dir()
+            full = (usb / "PIONEER").is_dir() or (usb / "Contents").is_dir()
+        except OSError:
+            continue
+        if not (lean or full):
+            continue
+        marker = None
+        try:
+            marker = json.loads((usb / "Playlists" / LEAN_MARKER).read_text()).get("backup")
+        except (OSError, ValueError):
+            pass
+        born = None
+        if lean:
+            st = (usb / "Playlists").stat()
+            born = getattr(st, "st_birthtime", None) or st.st_mtime
+        found.append(dict(name=usb.name, path=usb, uuid=volume_uuid(usb),
+                          lean=lean and not full, marker=marker, born=born))
+    return found
+
+
+def same_stick(backup: dict, stick: dict) -> bool:
+    if backup["uuid"] and stick["uuid"]:
+        return backup["uuid"] == stick["uuid"]
+    return backup["stick"] == stick["name"]
+
+
+def classify(backups: list, sticks: list) -> None:
+    """Sets each backup's status; see the module docstring."""
+    in_use = set()
+    for s in sticks:
+        if not s["lean"]:
+            continue
+        if s["marker"]:
+            in_use.add(s["marker"])
+            continue
+        # A stick made lean before markers existed restores from its newest
+        # older-style backup made around when it went lean (cdj400-restore's rule).
+        legacy = [b for b in backups if b["kind"] == "full" and b["stick"] == s["name"]]
+        legacy.sort(key=lambda b: b["made"], reverse=True)
+        if legacy and (s["born"] is None or abs(s["born"] - legacy[0]["made"]) <= LEGACY_WINDOW):
+            in_use.add(legacy[0]["name"])
+
+    for b in backups:
+        newer = [o for o in backups if o is not b and o["kind"] != "partial"
+                 and o["made"] > b["made"]
+                 and (o["uuid"] == b["uuid"] if o["uuid"] and b["uuid"] else o["stick"] == b["stick"])]
+        if b["name"] in in_use:
+            b["status"] = "in-use"
+        elif b["kind"] == "partial":
+            b["status"] = "incomplete"
+        elif any(not s["lean"] and same_stick(b, s) for s in sticks):
+            b["status"] = "not-needed"
+        elif newer:
+            b["status"] = "older"
+        else:
+            b["status"] = "latest"
+
+
+def load() -> list:
+    if not BACKUPS.is_dir():
+        return []
+    backups = [read_backup(p) for p in sorted(BACKUPS.iterdir())
+               if p.is_dir() and not p.name.startswith(".")]
+    classify(backups, plugged_in())
+    backups.sort(key=lambda b: (b["stick"].casefold(), -b["made"]))
+    return backups
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--delete", nargs="+", metavar="NAME")
+    ap.add_argument("--execute", action="store_true")
+    args = ap.parse_args()
+
+    if args.list:
+        for b in load():
+            print("\t".join([b["name"], b["stick"], str(b["made"]), str(b["bytes"]),
+                             b["kind"], b["status"], b["uuid"] or ""]))
+        return
+    if not args.delete:
+        ap.error("give --list or --delete NAME")
+
+    by_name = {b["name"]: b for b in load()}
+    chosen, problems = [], []
+    for name in args.delete:
+        if "/" in name or name in (".", "..") or name not in by_name:
+            problems.append(f"no backup called {name!r} in {BACKUPS}")
+        elif by_name[name]["status"] == "in-use":
+            problems.append(f"{name}: a plugged-in stick restores from it — kept")
+        else:
+            chosen.append(by_name[name])
+    for p in problems:
+        print("SKIP:", p)
+    total = sum(b["bytes"] for b in chosen)
+    for b in chosen:
+        print(f"{'delete' if args.execute else 'would delete'}: {b['name']} "
+              f"({b['bytes'] / 1e9:.2f} GB, {b['status']})")
+    if not args.execute:
+        print(f"\ndry run only — pass --execute to free {total / 1e9:.2f} GB")
+        return
+    for b in chosen:
+        shutil.rmtree(b["path"], ignore_errors=True)
+    gone = [b for b in chosen if not b["path"].exists()]
+    print(f"deleted {len(gone)} backup(s), freed {sum(b['bytes'] for b in gone) / 1e9:.2f} GB")
+    if len(gone) != len(chosen) or problems:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

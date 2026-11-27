@@ -8,17 +8,19 @@ The app is a front-end. The actual copying, exporting and sorting is done by the
 
 ## Features
 
-- **Stick list** in the window sidebar and in the menu bar. It refreshes automatically when a volume mounts or unmounts. Each stick shows its mode, free space, and a warning when something other than this app wrote to it in the last 90 seconds, which usually means Rekordbox is still syncing.
+- **Stick list** in the window sidebar and in the menu bar. It refreshes automatically when a volume mounts or unmounts. Each stick shows its mode, free space, and a warning when something other than this app wrote to it in the last 90 seconds while Rekordbox is open, which usually means it is still syncing.
 - **Health checks** with one-click fixes where possible:
   - `._` sidecar files. Fix: remove them.
-  - Spotlight indexing the stick. Fix: turn it off. This asks for your password.
+  - Spotlight indexing the stick. Fix: turn it off, which also leaves a `.metadata_never_index` marker so it stays off.
   - Non-MP3 audio the deck can't play.
   - Less than 10% free space.
   - A file system other than FAT32.
-- **Dry Run / Make Lean.** Exports the stick's own playlist manifest from Rekordbox. Dry Run previews the lean rebuild. Make Lean rebuilds `Playlists/`, then strips `PIONEER/` and `Contents/` once every file verifies.
-- **Restore to Rekordbox.** Returns a lean stick to Rekordbox mode.
+- **Dry Run / Make Lean.** Exports the stick's own playlist manifest from Rekordbox. Dry Run previews the lean rebuild. Make Lean backs up `PIONEER/` to your Mac, rebuilds `Playlists/`, then strips `PIONEER/` and `Contents/` once every file verifies.
+- **Readable file names.** With **Name Files "Artist - Title"** on (the default), Make Lean names every MP3 from Rekordbox's artist and title instead of the file name on your Mac, so it's readable on the CDJ-400's small screen. On a lean stick, **File Names** switches between those names and the originals. Your Mac files are never renamed.
+- **Restore to Rekordbox.** Moves the tracks back into `Contents/` and puts `PIONEER/` back from the backup Make Lean made. Restore checks that the backup belongs to this stick and this lean layout, so it never brings back an older export.
 - **Playlists on a lean stick.** Search playlists and track names. Add playlists straight from the Rekordbox library, with a check that they will fit. Sort tracks by BPM, key (Camelot) or name. Remove a playlist. Check every folder against Rekordbox and update only the ones that changed.
 - **Copy to…** copies all of a lean stick's playlists onto another lean stick.
+- **Restore Backups window** (the archive box in the sidebar toolbar, or the menu bar) lists every backup on your Mac with its stick, date and size, and says what each is still needed for. **Delete Unneeded** clears the ones nothing will restore from. A backup that a plugged-in stick needs can't be deleted.
 - **Output pane** with live progress (percent, MB/s, time left), a Stop button, and the logs of the last 25 runs. A notification is posted when a job finishes.
 
 | Shortcut | Action |
@@ -91,14 +93,17 @@ Sources/CDJ400UI/
   Stick.swift           Domain types: Stick, Playlist, StickIssue, PlaylistSync, StickAction
   StickScanner.swift    Reads /Volumes: mode, playlists, capacity, health
   StickCommands.swift   Every shell command the app runs, plus Job (what can run on a stick)
+                        (AppSettings, in Stick.swift, holds the tidy-names setting)
   CommandRunner.swift   Runs one job at a time, streams output, keeps run history
   Shell.swift           Short read-only commands; the Application Support folder
   ContentView.swift     Window layout and sidebar
   StickDetailView.swift The selected stick
   AddPlaylistSheet.swift
+  BackupsView.swift     The Restore Backups window
   LogView.swift         Output pane
   Theme.swift           Colors and shared view components
 Tests/CDJ400UITests/    Parsing, shell quoting, output streaming and tool smoke tests
+Tests/tools/            End-to-end tests of the tools on a fake stick (python3 -m unittest)
 tools/                  The cdj400-* command-line tools (see tools/README.md)
 packaging/              The Homebrew cask (release.sh fills in version and checksum)
 icon/                   App icon source (make-icon.swift) and the built AppIcon.icns
