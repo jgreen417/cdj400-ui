@@ -13,6 +13,10 @@ final class AppModel: ObservableObject {
     /// is running read this, so they don't redraw on every line of output;
     /// views that show the output observe `runner` themselves.
     @Published private(set) var isJobRunning = false
+    /// The stick the running job works on, so its view can show the copy arriving.
+    @Published private(set) var jobStick: String?
+    /// Total size of the restore backups on the Mac, for the sidebar.
+    @Published private(set) var backupBytes: Int64?
     let runner = CommandRunner()
 
     private var subscriptions: Set<AnyCancellable> = []
@@ -42,6 +46,16 @@ final class AppModel: ObservableObject {
 
         Notifier.requestPermission()
         refresh()
+        refreshBackups()
+    }
+
+    func refreshBackups() {
+        Task {
+            let result = await Shell.output(StickCommands.listBackups())
+            guard result.status == 0 else { return }
+            backupBytes = result.text.split(separator: "\n").compactMap(Backup.init(listLine:))
+                .reduce(0) { $0 + $1.bytes }
+        }
     }
 
     var selectedStick: Stick? { sticks.first { $0.path == selection } }
@@ -69,7 +83,9 @@ final class AppModel: ObservableObject {
     private func jobFinished() {
         for path in writing { lastAppWrite[path] = Date() }
         writing = []
+        jobStick = nil
         refresh()
+        refreshBackups()
         for (path, state) in syncState {
             switch state {
             case .checked: checkSync(path: path)
@@ -102,6 +118,7 @@ final class AppModel: ObservableObject {
     func run(_ job: Job, on stick: Stick) {
         guard !runner.isRunning else { return }
         writing = [stick.path]
+        jobStick = stick.path
         if case .copy(let target) = job { writing.insert(target.path) }
         runner.run(title: job.title(on: stick), command: job.command(on: stick))
     }

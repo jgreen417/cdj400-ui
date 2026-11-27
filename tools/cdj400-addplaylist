@@ -17,12 +17,17 @@ Safe to re-run: files already on the stick with the right size are kept, only
 missing or wrong-sized ones are copied. Other playlist folders are never touched.
 Copies data only (no xattrs), so macOS creates no ._ sidecars on FAT.
 
+File names: a folder whose files are named "Artist - Title" (cdj400-rename,
+or Make Lean with tidy names) gets new tracks named the same way. A new
+folder does with --tidy-names. Tracks are matched by their Mac name, which
+.cdj400-order.json records for every renamed file, so renamed or sorted
+tracks are never copied twice or pruned.
+
 Machine-readable progress lines (for the app):  PROGRESS <bytes_done> <bytes_total>
 """
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import shutil
 import subprocess
@@ -36,6 +41,10 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent  # sibling cdj400-* tools live here
+sys.dont_write_bytecode = True          # never write __pycache__ into the app bundle
+sys.path.insert(0, str(HERE))
+from cdj400_names import OrderFile, tidy_name, unique  # noqa: E402
+
 DBEXPORT = HERE / "cdj400-dbexport"
 SCRATCH = Path(tempfile.gettempdir()) / "cdj400"
 FAT32_BAD = '<>:"/\\|?*'
@@ -43,6 +52,7 @@ MAX_BASENAME = 100
 
 
 def fat32_safe(name: str) -> str:
+    """The name this tool always gave copies; kept so older sticks still match."""
     name = "".join(c for c in name if c not in FAT32_BAD).strip().rstrip(".")
     if len(name) > MAX_BASENAME:
         stem, dot, ext = name.rpartition(".")
@@ -58,18 +68,20 @@ def url_to_path(url: str) -> Path | None:
 
 
 def load_library(xml: Path):
-    """({TrackID: (path, size)}, {playlist name: [TrackID]}) from a dbexport XML."""
+    """({TrackID: (path, size)}, {playlist name: [TrackID]}, {TrackID: (artist, title)})
+    from a dbexport XML."""
     root = ET.parse(xml).getroot()
-    tracks = {}
+    tracks, meta = {}, {}
     for tr in root.find("COLLECTION"):
         p = url_to_path(tr.get("Location", ""))
         if p is not None:
             tracks[tr.get("TrackID")] = (p, int(tr.get("Size") or 0))
+            meta[tr.get("TrackID")] = (tr.get("Artist") or "", tr.get("Name") or "")
     playlists = {}
     for node in root.find("PLAYLISTS").iter("NODE"):
         if node.get("Type") == "1":
             playlists[node.get("Name")] = [t.get("Key") for t in node.findall("TRACK")]
-    return tracks, playlists
+    return tracks, playlists, meta
 
 
 def export_library(out: Path) -> None:
@@ -101,25 +113,16 @@ def find_folder(pl_root: Path, playlist: str) -> Path:
     return pl_root / fat32_safe(playlist)
 
 
-ORDER_FILE = ".cdj400-order.json"
 SORTER = HERE / "cdj400-sort"
 
 
-def sort_order(folder: Path) -> dict:
-    """What cdj400-sort recorded: {"by": ..., "original": {current name: original name}}."""
-    try:
-        return json.loads((folder / ORDER_FILE).read_text())
-    except (OSError, ValueError):
-        return {}
-
-
 def files_in(folder: Path) -> dict[str, tuple[Path, int]]:
-    """norm(original name) -> (path, size). A sorted folder's "001 - " names map
-    back to the original names cdj400-sort recorded."""
+    """norm(Mac name) -> (path, size). Sorted ("001 - ") and tidy ("Artist -
+    Title") names map back to the Mac names .cdj400-order.json recorded."""
     if not folder.is_dir():
         return {}
-    original = sort_order(folder).get("original", {})
-    return {norm(original.get(p.name, p.name)): (p, p.stat().st_size) for p in folder.iterdir()
+    order = OrderFile(folder)
+    return {norm(order.mac_name(p.name)): (p, p.stat().st_size) for p in folder.iterdir()
             if p.is_file() and not p.name.startswith(".") and not p.name.endswith(".part")}
 
 
@@ -134,8 +137,9 @@ def extras(have, plan) -> list[Path]:
     return sorted(p for key, (p, _) in have.items() if key not in expected)
 
 
-def build_plan(refs, tracks, folder: Path):
-    """[(src, dest, size)] for MP3s, plus skipped-non-mp3 and missing lists."""
+def build_plan(refs, tracks, folder: Path, meta=None):
+    """[(src, dest, size)] for MP3s, plus skipped-non-mp3 and missing lists.
+    With `meta` ({TrackID: (artist, title)}), dest names are "Artist - Title"."""
     plan, skipped, missing = [], [], []
     seen_src, seen_name = set(), set()
     for key in refs:
@@ -152,13 +156,17 @@ def build_plan(refs, tracks, folder: Path):
         if src in seen_src:
             continue
         seen_src.add(src)
-        dest_name = fat32_safe(src.name)
-        n = 2
-        while dest_name.casefold() in seen_name:
-            stem, _, ext = src.name.rpartition(".")
-            dest_name = fat32_safe(f"{stem} [{n}].{ext}")
-            n += 1
-        seen_name.add(dest_name.casefold())
+        if meta is not None:
+            artist, title = meta.get(key, ("", ""))
+            dest_name = unique(tidy_name(artist, title, fat32_safe(src.name)), seen_name)
+        else:
+            dest_name = fat32_safe(src.name)
+            n = 2
+            while dest_name.casefold() in seen_name:
+                stem, _, ext = src.name.rpartition(".")
+                dest_name = fat32_safe(f"{stem} [{n}].{ext}")
+                n += 1
+            seen_name.add(dest_name.casefold())
         plan.append((src, folder / dest_name, src.stat().st_size))
     return plan, skipped, missing
 
@@ -178,6 +186,8 @@ def main():
                     help="after copying, delete tracks no longer in the playlist")
     ap.add_argument("--execute", action="store_true")
     ap.add_argument("--xml", help="use this dbexport XML instead of exporting the live library")
+    ap.add_argument("--tidy-names", action="store_true",
+                    help='name a NEW folder\'s files "Artist - Title" (an existing folder keeps its own style)')
     args = ap.parse_args()
 
     usb = Path(args.usb)
@@ -190,7 +200,7 @@ def main():
     else:
         xml = SCRATCH / "addplaylist-library.xml"
         export_library(xml)
-    tracks, playlists = load_library(xml)
+    tracks, playlists, meta = load_library(xml)
 
     if args.list:
         have = on_stick(pl_root)
@@ -213,7 +223,8 @@ def main():
                 if name is None:
                     print(f"{folder.name}\t\t-1\t-1\t0")
                     continue
-                plan, _, _ = build_plan(playlists[name], tracks, folder)
+                plan, _, _ = build_plan(playlists[name], tracks, folder,
+                                        meta if OrderFile(folder).tidy else None)
                 have = files_in(folder)
                 todo = [(s, d, z) for s, d, z in plan if not on_disk(have, s, d, z)]
                 print(f"{folder.name}\t{name}\t{len(todo)}\t{len(extras(have, plan))}"
@@ -228,7 +239,10 @@ def main():
                  + (f"\n  did you mean: {', '.join(close[:8])}" if close else ""))
 
     folder = find_folder(pl_root, args.playlist)
-    plan, skipped, missing = build_plan(playlists[args.playlist], tracks, folder)
+    order = OrderFile(folder)
+    tidy = order.tidy if folder.is_dir() and any(folder.iterdir()) else args.tidy_names
+    plan, skipped, missing = build_plan(playlists[args.playlist], tracks, folder,
+                                        meta if tidy else None)
     if not plan:
         sys.exit("nothing to copy: no MP3s found for that playlist")
 
@@ -253,6 +267,26 @@ def main():
         return
 
     folder.mkdir(parents=True, exist_ok=True)
+    # A wrong-sized copy of the same track is replaced where it is, under its
+    # current (maybe sorted or tidy) name. Any other file already using the
+    # planned name belongs to a different track, so the copy gets the next
+    # free name instead of overwriting it.
+    taken = {norm(p.name) for p in folder.iterdir()}
+    by_mac = {}
+    for p in folder.iterdir():
+        if p.is_file() and not p.name.startswith("."):
+            by_mac.setdefault(norm(order.mac_name(p.name)), p.name)
+    placed = []
+    for src, dest, size in todo:
+        same = by_mac.get(norm(src.name)) or by_mac.get(norm(fat32_safe(src.name)))
+        if same:
+            dest = folder / same
+        elif norm(dest.name) in taken:
+            dest = folder / unique(dest.name, taken)
+        else:
+            taken.add(norm(dest.name))
+        placed.append((src, dest, size))
+    todo = placed
     done, t0 = 0, time.time()
     print(f"PROGRESS 0 {need}", flush=True)
     for src, dest, size in todo:
@@ -263,7 +297,12 @@ def main():
         done += size
         rate = done / max(time.time() - t0, 0.01)
         print(f"PROGRESS {done} {need}  {rate / 1e6:.1f}MB/s  {dest.name}", flush=True)
+        if dest.name != src.name:
+            order.original[dest.name] = src.name   # so the next run still matches it
 
+    if tidy:
+        order.names = "tidy"
+    order.save()
     have = files_in(folder)
     bad = [d for s, d, z in plan if not on_disk(have, s, d, z)]
     if bad:
@@ -277,9 +316,13 @@ def main():
         p.unlink(missing_ok=True)
     for p in stale:
         p.unlink(missing_ok=True)
+        order.original.pop(p.name, None)
+        order.prefixed.discard(p.name)
+    if stale:
+        order.save()
     if stale:
         print(f"removed {len(stale)} track(s) no longer in the playlist")
-    by = sort_order(folder).get("by")
+    by = order.by
     if by and (todo or stale):
         sys.stdout.flush()
         subprocess.run([str(SORTER), str(usb), "--by", by, "--folder", folder.name,

@@ -30,18 +30,26 @@ enum StickCommands {
     }
 
     /// Exports this stick's Rekordbox manifest, then rebuilds Playlists/ from
-    /// it; without `execute` the adopt step only previews.
-    static func makeLean(stick: Stick, execute: Bool) -> String {
-        let adopt = "\(tool("cdj400-adopt")) \(quote(xmlPath(for: stick))) \(quote(stick.path))"
+    /// it; without `execute` the adopt step only previews. `tidy` names the
+    /// files "Artist - Title".
+    static func makeLean(stick: Stick, execute: Bool, tidy: Bool) -> String {
+        var adopt = "\(tool("cdj400-adopt")) \(quote(xmlPath(for: stick))) \(quote(stick.path))"
+        if tidy { adopt += " --tidy-names" }
         return export(stick: stick) + " && " + (execute ? adopt + " --execute" : adopt)
+    }
+
+    /// Renames every file on a lean stick to "Artist - Title", or back to the Mac names.
+    static func rename(stick: Stick, tidy: Bool) -> String {
+        "\(tool("cdj400-rename")) \(quote(stick.path)) \(tidy ? "--tidy" : "--original") --execute"
     }
 
     static func restore(stick: Stick) -> String {
         "\(tool("cdj400-restore")) \(quote(stick.path))"
     }
 
-    static func addPlaylist(stick: Stick, name: String, execute: Bool) -> String {
-        let base = "\(tool("cdj400-addplaylist")) \(quote(stick.path)) \(quote(name))"
+    static func addPlaylist(stick: Stick, name: String, execute: Bool, tidy: Bool) -> String {
+        var base = "\(tool("cdj400-addplaylist")) \(quote(stick.path)) \(quote(name))"
+        if tidy { base += " --tidy-names" }
         return execute ? base + " --execute" : base
     }
 
@@ -94,6 +102,19 @@ enum StickCommands {
     static func eject(stick: Stick) -> String {
         "diskutil eject \(quote(stick.path))"
     }
+
+    /// Where Make Lean (and the older finalize/prestrip tools) keep restore backups.
+    static let backupsFolder = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Music/DJ.CDJ400-BACKUPS", isDirectory: true)
+
+    static func listBackups() -> String {
+        "\(tool("cdj400-backups")) --list"
+    }
+
+    /// Deletes these backups; the tool keeps any a plugged-in stick restores from.
+    static func deleteBackups(_ names: [String]) -> String {
+        "\(tool("cdj400-backups")) --delete \(names.map(quote).joined(separator: " ")) --execute"
+    }
 }
 
 /// Everything the app can run against a stick.
@@ -106,6 +127,7 @@ enum Job: Hashable {
     case disableSpotlight
     case removePlaylist(String)
     case copy(to: Stick)
+    case rename(tidy: Bool)
     case eject
 
     var title: String {
@@ -122,6 +144,7 @@ enum Job: Hashable {
         case .disableSpotlight: "Turn off Spotlight"
         case .removePlaylist(let name): "Remove \(name)"
         case .copy(let target): "Copy to \(target.name)"
+        case .rename(let tidy): tidy ? "Name files Artist - Title" : "Use original file names"
         case .eject: "Eject"
         }
     }
@@ -134,14 +157,14 @@ enum Job: Hashable {
         case .removePlaylist: true
         case .update(let syncs): syncs.contains { $0.toRemove > 0 }
         case .removeSidecars: true
-        case .addPlaylists, .copy, .eject, .disableSpotlight, .sort: false
+        case .addPlaylists, .copy, .eject, .disableSpotlight, .sort, .rename: false
         }
     }
 
     /// Text for the confirmation dialog, or nil when the job runs straight away.
     func confirmation(on stick: Stick) -> String? {
         switch self {
-        case .eject, .addPlaylists, .removeSidecars, .disableSpotlight, .sort:
+        case .eject, .addPlaylists, .removeSidecars, .disableSpotlight, .sort, .rename:
             return nil
         case .update(let syncs):
             let removing = syncs.reduce(0) { $0 + $1.toRemove }
@@ -161,13 +184,14 @@ enum Job: Hashable {
     func command(on stick: Stick) -> String {
         switch self {
         case .action(.dryRun):
-            StickCommands.makeLean(stick: stick, execute: false)
+            StickCommands.makeLean(stick: stick, execute: false, tidy: AppSettings.tidyNames)
         case .action(.makeLean):
-            StickCommands.makeLean(stick: stick, execute: true)
+            StickCommands.makeLean(stick: stick, execute: true, tidy: AppSettings.tidyNames)
         case .action(.restore):
             StickCommands.restore(stick: stick)
         case .addPlaylists(let names, let execute):
-            names.map { StickCommands.addPlaylist(stick: stick, name: $0, execute: execute) }
+            names.map { StickCommands.addPlaylist(stick: stick, name: $0, execute: execute,
+                                                  tidy: stick.addsTidyNames) }
                 .joined(separator: " && ")
         case .update(let syncs):
             syncs.map { StickCommands.updatePlaylist(stick: stick, $0) }.joined(separator: " && ")
@@ -181,6 +205,8 @@ enum Job: Hashable {
             StickCommands.removePlaylist(stick: stick, name: name)
         case .copy(let target):
             StickCommands.copyStick(from: stick, to: target)
+        case .rename(let tidy):
+            StickCommands.rename(stick: stick, tidy: tidy)
         case .eject:
             StickCommands.eject(stick: stick)
         }

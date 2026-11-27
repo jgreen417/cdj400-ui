@@ -79,6 +79,8 @@ final class CommandRunner: ObservableObject {
     private var partialLine = Data()
     private var progressStart: Date?
     private var currentTitle = ""
+    /// The running job's title, e.g. "Add playlist Disco — DECK A".
+    var runningTitle: String { currentTitle }
     private var isStopping = false
 
     func run(title: String, command: String) {

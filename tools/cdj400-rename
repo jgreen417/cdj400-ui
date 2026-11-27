@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""cdj400-rename — switch a lean stick's file names between "Artist - Title"
+(from Rekordbox's metadata, easy to read on the CDJ-400's small screen) and
+the original Mac file names.
+
+Usage:
+  cdj400-rename <usb> --tidy      [--folder NAME ...]             # dry run
+  cdj400-rename <usb> --tidy      [--folder NAME ...] --execute   # rename
+  cdj400-rename <usb> --original  [--folder NAME ...] --execute   # put the Mac names back
+
+No --folder means every folder in Playlists/.
+
+Renames happen on the stick, so nothing is copied and it's instant. Sort
+order is kept: a "001 - " prefix from cdj400-sort stays in front of the new
+name. Each folder's .cdj400-order.json records the Mac name of every renamed
+file, so Check / Update and Sort still recognise every track, and --original
+can always put the old names back.
+
+A track Rekordbox no longer knows keeps its current name under --tidy.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent  # sibling cdj400-* tools live here
+sys.dont_write_bytecode = True          # never write __pycache__ into the app bundle
+sys.path.insert(0, str(HERE))
+from cdj400_names import (OrderFile, load_metadata, mp3s, norm, tidy_name,  # noqa: E402
+                          unique)
+
+DBEXPORT = HERE / "cdj400-dbexport"
+SCRATCH = Path(tempfile.gettempdir()) / "cdj400"
+
+
+def plan_folder(folder: Path, tidy: bool, meta: dict):
+    """[(current path, new name, Mac name)] for every MP3, in folder order."""
+    order = OrderFile(folder)
+    files = mp3s(folder)
+    plan, taken, unknown = [], set(), 0
+    for p in files:
+        mac = order.mac_name(p.name)
+        prefix = p.name[: len(p.name) - len(order.base(p.name))]
+        if tidy:
+            hit = meta.get((norm(mac), p.stat().st_size)) or meta.get((norm(mac), None))
+            if hit:
+                base = tidy_name(hit[0], hit[1], mac)
+            else:
+                base = order.base(p.name)
+                unknown += 1
+        else:
+            base = mac
+        new = unique(prefix + base, taken)
+        plan.append((p, new, mac, bool(prefix)))
+    return order, plan, unknown
+
+
+def rename_folder(folder: Path, tidy: bool, meta: dict, execute: bool) -> int:
+    order, plan, unknown = plan_folder(folder, tidy, meta)
+    changes = [(p, new) for p, new, _, _ in plan if p.name != new]
+    print(f"{folder.name}: {len(plan)} tracks, {len(changes)} to rename"
+          + (f" ({unknown} not in Rekordbox, names kept)" if unknown else ""))
+    for p, new in changes[:200]:
+        print(f"  {p.name}\n    -> {new}")
+    if len(changes) > 200:
+        print(f"  … and {len(changes) - 200} more")
+    if not execute:
+        return len(changes)
+
+    # Two passes through temporary names, so swapping two names never collides.
+    temps = []
+    for i, (p, new) in enumerate(changes):
+        tmp = folder / f".cdj400-rename-{i}.tmp"
+        os.rename(p, tmp)
+        temps.append((tmp, new))
+    for tmp, new in temps:
+        os.rename(tmp, folder / new)
+
+    order.names = "tidy" if tidy else "original"
+    order.original = {new: mac for _, new, mac, _ in plan}
+    order.prefixed = {new for _, new, _, had_prefix in plan if had_prefix}
+    order.save()
+    for p in list(folder.glob("._*")) + list(folder.parent.glob("._*")):
+        p.unlink(missing_ok=True)        # macOS writes these on FAT when renaming
+    return len(changes)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("usb")
+    mode = ap.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--tidy", action="store_true", help='name files "Artist - Title"')
+    mode.add_argument("--original", action="store_true", help="put the Mac file names back")
+    ap.add_argument("--folder", action="append", default=[])
+    ap.add_argument("--execute", action="store_true")
+    ap.add_argument("--xml", help="use this dbexport XML instead of exporting the live library")
+    args = ap.parse_args()
+
+    pl_root = Path(args.usb) / "Playlists"
+    if not pl_root.is_dir():
+        sys.exit(f"no Playlists/ on {args.usb}: only a lean stick can be renamed")
+    folders = [pl_root / f for f in args.folder] if args.folder else sorted(
+        p for p in pl_root.iterdir() if p.is_dir() and not p.name.startswith("."))
+    for f in folders:
+        if not f.is_dir():
+            sys.exit(f"no folder {f}")
+        leftover = list(f.glob(".cdj400-rename-*.tmp"))
+        if leftover:
+            sys.exit(f"{f} has files from an interrupted rename ({leftover[0].name}):"
+                     " give them back their names first")
+
+    meta = {}
+    if args.tidy:
+        if args.xml:
+            xml = Path(args.xml)
+        else:
+            xml = SCRATCH / "rename-library.xml"
+            xml.parent.mkdir(parents=True, exist_ok=True)
+            r = subprocess.run([str(DBEXPORT), "-o", str(xml)], capture_output=True, text=True)
+            if r.returncode != 0:
+                sys.exit(f"cdj400-dbexport failed:\n{r.stdout}{r.stderr}")
+        meta = load_metadata(xml)
+
+    total = sum(rename_folder(f, args.tidy, meta, args.execute) for f in folders)
+    what = '"Artist - Title"' if args.tidy else "their original names"
+    if args.execute:
+        print(f"\nrenamed {total} file(s) to {what}")
+    else:
+        print(f"\ndry run only — pass --execute to rename {total} file(s) to {what}")
+
+
+if __name__ == "__main__":
+    main()

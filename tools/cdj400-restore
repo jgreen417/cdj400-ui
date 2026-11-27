@@ -1,72 +1,313 @@
-#!/bin/bash
-# cdj400-restore — undo a lean strip: copy PIONEER/ + Contents/ back onto a stick
-# from its newest backup in ~/Music/DJ.CDJ400-BACKUPS/.
-#
-# Usage: cdj400-restore /Volumes/MYSTICK [--consume]
-#   --consume   delete the backup afterwards (verified restore only). The backup
-#               exists solely to make this restore possible, so once the stick
-#               holds that data again it is redundant.
-set -eu
-USB="${1:?usage: cdj400-restore <usb-mount> [--consume]}"
-CONSUME=0
-for arg in "$@"; do
-  if [ "$arg" = "--consume" ]; then CONSUME=1; fi
-done
-NAME="$(basename "$USB")"
-BACKUPS="$HOME/Music/DJ.CDJ400-BACKUPS"
-if [ ! -d "$USB" ]; then echo "not mounted: $USB"; exit 1; fi
+#!/usr/bin/env python3
+"""cdj400-restore — put a lean stick back into Rekordbox mode.
 
-# Prefer the newest backup carrying a .complete marker — an interrupted backup
-# can leave a partial dir that would otherwise win on mtime alone.
-DIR=""
-FALLBACK=""
-while IFS= read -r cand; do
-  [ -d "$cand" ] || continue
-  if [ -f "$cand/.complete" ]; then DIR="$cand"; break; fi
-  if [ -z "$FALLBACK" ]; then FALLBACK="$cand"; fi
-done <<< "$(ls -dt "$BACKUPS/$NAME"-* 2>/dev/null || true)"
-if [ -z "$DIR" ]; then DIR="$FALLBACK"; fi
+Usage:
+  cdj400-restore <usb-mount>                    # restore
+  cdj400-restore <usb-mount> --dry-run          # say what would happen
+  cdj400-restore <usb-mount> --keep-playlists   # leave Playlists/ on the stick too
+  cdj400-restore <usb-mount> --consume          # delete the backup afterwards
+  cdj400-restore <usb-mount> --allow-old        # accept an older-style backup that
+                                                #   doesn't look like this stick's
 
-if [ -z "$DIR" ] || [ ! -d "$DIR" ]; then
-  echo "no backup for $NAME under $BACKUPS"
-  echo
-  echo "Fallback (no backup needed): plug $NAME into Rekordbox and run Sync Manager."
-  echo "A lean stick has no PIONEER/ database, so Rekordbox treats it as a NEW device"
-  echo "and does a full fresh export (rebuilds PIONEER/ + Contents/ + Playlists/)."
-  echo "Then eject; re-strip with 'cdj400-usb --lean' before the next CDJ-400 use."
-  exit 1
-fi
-echo "Restoring $NAME from: $DIR ($(du -sh "$DIR" | cut -f1))"
-if [ ! -f "$DIR/.complete" ]; then
-  echo "WARN: no .complete marker — written by an older tool version, or the backup"
-  echo "      was interrupted. Restoring whatever PIONEER/Contents it does contain."
-fi
-RESTORED=""
-for part in PIONEER Contents; do
-  if [ ! -d "$DIR/$part" ]; then continue; fi
-  if [ -e "$USB/$part" ]; then
-    echo "REFUSE: $USB/$part already exists — resolve manually"; exit 1
-  fi
-  echo "  restoring $part ..."
-  rsync -a --checksum "$DIR/$part/" "$USB/$part/"
-  RESTORED="$RESTORED $part"
-done
-if [ -z "$RESTORED" ]; then
-  echo "REFUSE: this backup holds neither PIONEER/ nor Contents/ — nothing to restore."
-  echo "        Backup left untouched: $DIR"
-  exit 1
-fi
-dot_clean "$USB" 2>/dev/null || true
-find "$USB" -name '._*' -delete 2>/dev/null || true
-echo "Restored:$RESTORED"
-echo "Rekordbox will show the device out-of-date until the next sync — expected."
-if [ "$CONSUME" = "1" ]; then
-  echo "Deleting consumed backup: $DIR ($(du -sh "$DIR" | cut -f1))"
-  rm -rf "$DIR"
-  echo "Laptop side clean — the stick is now the only copy of that export."
-else
-  echo
-  echo "Backup kept: $DIR ($(du -sh "$DIR" | cut -f1))"
-  echo "It stays as $NAME's fast-restore path. Delete it once Rekordbox confirms the stick:"
-  echo "  rm -rf \"$DIR\""
-fi
+Which backup: Make Lean writes Playlists/.cdj400-lean.json naming the exact
+backup it made, so that one is used, and its volume UUID must match the
+stick's. Without that marker (a stick made lean by an older version), the
+newest older-style backup for the stick's name is used, but only when it was
+made within a day of the stick's Playlists/ folder; otherwise it's probably
+from an earlier export, or another stick with the same name, and restoring it
+would bring back stale playlists. --allow-old overrides that check.
+
+Make Lean backups (restore-map.json): every file Make Lean moved out of
+Contents/ is moved back from Playlists/, which is instant on the same stick.
+A file that has since left the stick is copied from the Mac. The Contents/
+files no playlist used, and PIONEER/, come back from the backup. Renamed or
+sorted files are matched by their Mac name, so "Artist - Title" names
+need no separate undo.
+
+Older-style backups (cdj400-finalize --lean, cdj400-prestrip) hold all of
+Contents/ and PIONEER/, which are copied back as before.
+
+After a verified restore, Playlists/ is removed: its tracks are either back
+in Contents/ or duplicates of files on the Mac, and leaving them doubles the
+space the music takes. --keep-playlists keeps it.
+
+If there's no usable backup, plug the stick into Rekordbox and sync it. A lean
+stick has no PIONEER/ database, so Rekordbox treats it as a new device and does
+a full fresh export.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import plistlib
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent  # sibling cdj400-* tools live here
+sys.dont_write_bytecode = True          # never write __pycache__ into the app bundle
+sys.path.insert(0, str(HERE))
+from cdj400_names import OrderFile, norm  # noqa: E402
+
+BACKUPS = Path.home() / "Music/DJ.CDJ400-BACKUPS"
+LEAN_MARKER = ".cdj400-lean.json"
+STAMP = re.compile(r"-(\d{8}-\d{6})(?:-\d+)?$")
+LEGACY_WINDOW = 24 * 3600   # seconds an older-style backup may be from the lean render
+
+RESYNC = ("Instead: plug {name} into Rekordbox and sync it in Sync Manager. A lean stick\n"
+          "has no PIONEER/ database, so Rekordbox treats it as a new device and does a\n"
+          "full fresh export. Eject it afterwards and Make Lean again before the next\n"
+          "CDJ-400 gig.")
+
+
+def size_of(path) -> int:
+    try:
+        return Path(path).stat().st_size
+    except OSError:
+        return -1
+
+
+def volume_uuid(usb):
+    try:
+        out = subprocess.run(["diskutil", "info", "-plist", str(usb)],
+                             capture_output=True, timeout=20).stdout
+        return plistlib.loads(out).get("VolumeUUID") or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def stamp_time(name: str):
+    m = STAMP.search(name)
+    if not m:
+        return None
+    try:
+        return time.mktime(time.strptime(m.group(1), "%Y%m%d-%H%M%S"))
+    except ValueError:
+        return None
+
+
+def fail(msg: str, name: str):
+    print(msg)
+    print()
+    print(RESYNC.format(name=name))
+    sys.exit(1)
+
+
+def find_backup(usb: Path, allow_old: bool):
+    """(backup dir, restore-map or None). Exits with advice when there's no safe one."""
+    marker = usb / "Playlists" / LEAN_MARKER
+    if marker.is_file():
+        try:
+            info = json.loads(marker.read_text())
+        except ValueError:
+            info = {}
+        named = info.get("backup")
+        backup = BACKUPS / named if named else None
+        if backup is None or not (backup / ".complete").is_file() \
+                or not (backup / "restore-map.json").is_file():
+            fail(f"REFUSE: {usb.name} was made lean with backup {named!r}, but that backup is\n"
+                 f"        missing or incomplete under {BACKUPS}.", usb.name)
+        journal = json.loads((backup / "restore-map.json").read_text())
+        mine, theirs = volume_uuid(usb), journal.get("volume_uuid")
+        if mine and theirs and mine != theirs:
+            fail(f"REFUSE: {backup.name} was made from a different stick (volume UUID\n"
+                 f"        {theirs}, this one is {mine}).", usb.name)
+        return backup, journal
+
+    # A stick made lean before the marker existed: the older-style backups.
+    pattern = re.compile(re.escape(usb.name) + STAMP.pattern)
+    cands = sorted((p for p in BACKUPS.glob("*") if p.is_dir() and pattern.fullmatch(p.name)),
+                   key=lambda p: stamp_time(p.name) or 0, reverse=True)
+    complete = [p for p in cands if (p / ".complete").is_file()]
+    backup = (complete or cands or [None])[0]
+    if backup is None:
+        fail(f"no backup for {usb.name} under {BACKUPS}", usb.name)
+    if (backup / "restore-map.json").is_file():
+        # An adopt backup the marker doesn't point at: the stick was made lean
+        # again since, so this one describes an older export.
+        if not allow_old:
+            fail(f"REFUSE: {usb.name} has no Make Lean marker, and the newest backup\n"
+                 f"        ({backup.name}) doesn't belong to its current layout.", usb.name)
+        return backup, json.loads((backup / "restore-map.json").read_text())
+    pl = usb / "Playlists"
+    made = stamp_time(backup.name)
+    lean_at = None
+    if pl.is_dir():
+        st = pl.stat()
+        lean_at = getattr(st, "st_birthtime", None) or st.st_mtime
+    if not allow_old and made and lean_at and abs(lean_at - made) > LEGACY_WINDOW:
+        days = abs(lean_at - made) / 86400
+        fail(f"REFUSE: the newest backup for {usb.name} ({backup.name}) is {days:.1f} days\n"
+             f"        apart from when this stick was made lean, so it's probably an older\n"
+             f"        export (or another stick called {usb.name}). Restoring it would bring\n"
+             f"        back out-of-date playlists. --allow-old restores it anyway.", usb.name)
+    if not (backup / ".complete").is_file():
+        print("WARN: no .complete marker: the backup was interrupted, or made by an older\n"
+              "      version. Restoring whatever PIONEER/ and Contents/ it holds.")
+    return backup, None
+
+
+def playlist_index(usb: Path) -> dict:
+    """{(norm(Mac name), size): [paths]} for every MP3 in Playlists/, whatever
+    it's called now (sorted, tidy or original)."""
+    index = {}
+    root = usb / "Playlists"
+    if not root.is_dir():
+        return index
+    for folder in sorted(p for p in root.iterdir() if p.is_dir()):
+        order = OrderFile(folder)
+        for p in sorted(folder.iterdir()):
+            if p.is_file() and not p.name.startswith("."):
+                index.setdefault((norm(order.mac_name(p.name)), size_of(p)), []).append(p)
+    return index
+
+
+def copy_tree(src: Path, dst: Path) -> None:
+    dst.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["rsync", "-a", str(src) + "/", str(dst) + "/"], check=True)
+
+
+def restore_adopt(usb: Path, backup: Path, journal: dict, dry_run: bool) -> list:
+    """Move Make Lean's files back into Contents/. Returns problems found."""
+    index = playlist_index(usb)
+    plan, need = [], 0
+    for m in journal.get("moves", []):
+        dst = usb / m["contents"]
+        size = m["size"]
+        if size_of(dst) == size:
+            plan.append(("ok", None, dst, m))
+            continue
+        cands = index.get((norm(m["mac_name"]), size), [])
+        if cands:
+            plan.append(("move", cands.pop(0), dst, m))
+        elif size_of(m["mac"]) == size:
+            plan.append(("mac", Path(m["mac"]), dst, m))
+            need += size
+        else:
+            plan.append(("missing", None, dst, m))
+    kept = journal.get("kept", [])
+    need += sum(max(size_of(backup / k), 0) for k in kept)
+    need += sum(max(size_of(p), 0) for p in (backup / "PIONEER").rglob("*")) \
+        if (backup / "PIONEER").is_dir() else 0
+    count = {k: sum(1 for x in plan if x[0] == k) for k in ("ok", "move", "mac", "missing")}
+    print(f"Make Lean backup: {backup.name}")
+    print(f"  {count['move']} files move back from Playlists/ (instant)")
+    print(f"  {count['mac']} files copy from the Mac (no longer on the stick)")
+    print(f"  {len(kept)} unused Contents/ files + {journal.get('pioneer_files', 0)} PIONEER/ files"
+          f" copy from the backup")
+    if count["ok"]:
+        print(f"  {count['ok']} already in place")
+    problems = [f"gone from the stick and the Mac: {x[3]['mac_name']}" for x in plan
+                if x[0] == "missing"]
+    for p in problems[:20]:
+        print("  MISSING:", p)
+    free = shutil.disk_usage(usb).free
+    if need * 1.05 + (50 << 20) > free:
+        sys.exit(f"NOT ENOUGH SPACE: the restore copies ~{need / 1e9:.1f} GB onto a stick with "
+                 f"{free / 1e9:.1f} GB free. Remove a playlist first, or re-sync in Rekordbox.")
+    if dry_run:
+        return problems
+
+    for kind, src, dst, m in plan:
+        if kind in ("ok", "missing"):
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if kind == "move":
+            os.rename(src, dst)
+        else:
+            shutil.copyfile(src, dst)
+    for k in kept:
+        dst = usb / k
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(backup / k, dst)
+    if (backup / "PIONEER").is_dir():
+        copy_tree(backup / "PIONEER", usb / "PIONEER")
+
+    bad = [str(dst) for kind, _, dst, m in plan if kind != "missing" and size_of(dst) != m["size"]]
+    bad += [k for k in kept if size_of(usb / k) != size_of(backup / k)]
+    if (backup / "PIONEER").is_dir():
+        bad += [str(p) for p in (backup / "PIONEER").rglob("*")
+                if p.is_file() and size_of(usb / p.relative_to(backup)) != size_of(p)]
+    if bad:
+        print("\nVERIFY FAILED — Playlists/ and the backup are left as they are:")
+        for b in bad[:20]:
+            print("  ", b)
+        sys.exit(1)
+    return problems
+
+
+def restore_legacy(usb: Path, backup: Path, dry_run: bool) -> list:
+    parts = [p for p in ("PIONEER", "Contents") if (backup / p).is_dir()]
+    if not parts:
+        sys.exit(f"REFUSE: {backup} holds neither PIONEER/ nor Contents/ — nothing to restore.")
+    print(f"Restoring {usb.name} from: {backup}")
+    if dry_run:
+        print(f"  would copy back: {', '.join(parts)}")
+        return []
+    for part in parts:
+        print(f"  restoring {part} ...", flush=True)
+        copy_tree(backup / part, usb / part)
+    src_n = sum(1 for part in parts for p in (backup / part).rglob("*") if p.is_file())
+    dst_n = sum(1 for part in parts for p in (usb / part).rglob("*")
+                if p.is_file() and not p.name.startswith("._"))
+    if dst_n < src_n:
+        print(f"\nVERIFY FAILED: {src_n} files in the backup, {dst_n} on the stick."
+              " Playlists/ and the backup are left as they are.")
+        sys.exit(1)
+    return []
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("usb")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--keep-playlists", action="store_true",
+                    help="leave Playlists/ on the stick after restoring")
+    ap.add_argument("--consume", action="store_true",
+                    help="delete the backup after a verified restore")
+    ap.add_argument("--allow-old", action="store_true",
+                    help="accept an older-style backup that doesn't look like this stick's")
+    args = ap.parse_args()
+
+    usb = Path(args.usb)
+    if not usb.is_dir():
+        sys.exit(f"not mounted: {usb}")
+    for part in ("PIONEER", "Contents"):
+        if (usb / part).exists():
+            sys.exit(f"REFUSE: {usb / part} already exists: the stick is already in"
+                     " Rekordbox mode, or half-restored. Resolve that by hand first.")
+
+    backup, journal = find_backup(usb, args.allow_old)
+    problems = (restore_adopt(usb, backup, journal, args.dry_run) if journal
+                else restore_legacy(usb, backup, args.dry_run))
+    if args.dry_run:
+        print("\ndry run only — nothing changed")
+        return
+
+    if not args.keep_playlists and (usb / "Playlists").exists():
+        subprocess.run(["rm", "-rf", str(usb / "Playlists")], check=False)
+        print("  removed Playlists/ (its tracks are back in Contents/, or on the Mac)")
+    subprocess.run(["dot_clean", str(usb)], check=False, capture_output=True)
+    for p in usb.rglob("._*"):
+        p.unlink(missing_ok=True)
+    print(f"\nRestored {usb.name} to Rekordbox mode from {backup.name}.")
+    print("Rekordbox will show the device out-of-date until the next sync — expected.")
+    if problems:
+        print(f"{len(problems)} track(s) the stick's database lists were on neither the stick"
+              " nor the Mac, so they're still missing. Sync the stick in Rekordbox to sort"
+              " that out.")
+    if args.consume:
+        shutil.rmtree(backup, ignore_errors=True)
+        print(f"Deleted the consumed backup: {backup}")
+    else:
+        print(f"Backup kept: {backup}")
+        print("It's no longer needed once Rekordbox has synced the stick. Delete it with:")
+        print(f'  rm -rf "{backup}"')
+
+
+if __name__ == "__main__":
+    main()

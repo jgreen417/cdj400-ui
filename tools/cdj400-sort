@@ -16,13 +16,13 @@ The order the CDJ-400 lists files in is either by filename or by the order
 they were written, so this does both: bpm/key prefix each file "001 - " and
 the folder is rebuilt by moving files into a fresh folder in that order (a
 rename on the same stick, so it is instant and copies nothing).
-<folder>/.cdj400-order.json remembers each file's original name and the
-order, so cdj400-addplaylist can still match tracks and re-sort after adding.
+<folder>/.cdj400-order.json remembers each file's Mac name, which files carry
+a prefix and the order, so cdj400-addplaylist can still match tracks and
+re-sort after adding. Tidy "Artist - Title" names (cdj400-rename) are kept.
 """
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import shutil
 import subprocess
@@ -35,9 +35,12 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent  # sibling cdj400-* tools live here
+sys.dont_write_bytecode = True          # never write __pycache__ into the app bundle
+sys.path.insert(0, str(HERE))
+from cdj400_names import ORDER_FILE, OrderFile, mp3s  # noqa: E402
+
 DBEXPORT = HERE / "cdj400-dbexport"
 SCRATCH = Path(tempfile.gettempdir()) / "cdj400"
-ORDER_FILE = ".cdj400-order.json"
 
 CAMELOT = {
     "Abm": "1A", "G#m": "1A", "Ebm": "2A", "D#m": "2A", "Bbm": "3A", "A#m": "3A",
@@ -77,13 +80,6 @@ def load_analysis(xml: Path) -> dict[str, list[tuple[int, float, str]]]:
     return index
 
 
-def read_order(folder: Path) -> dict:
-    try:
-        return json.loads((folder / ORDER_FILE).read_text())
-    except (OSError, ValueError):
-        return {}
-
-
 def camelot_rank(key: str) -> tuple[int, int]:
     code = CAMELOT.get(key)
     if code is None:
@@ -92,20 +88,20 @@ def camelot_rank(key: str) -> tuple[int, int]:
 
 
 def sort_folder(folder: Path, by: str, index, execute: bool) -> None:
-    rename_back = read_order(folder).get("original", {})
+    order = OrderFile(folder)
     tracks = []
-    for p in folder.iterdir():
-        if not p.is_file() or p.name.startswith(".") or p.suffix.lower() != ".mp3":
-            continue
-        original = rename_back.get(p.name) or p.name
+    for p in mp3s(folder):
+        original = order.mac_name(p.name)
         size = p.stat().st_size
         matches = index.get(norm(original), [])
         bpm, key = next(((b, k) for s, b, k in matches if s == size),
                         (matches[0][1], matches[0][2]) if matches else (0.0, ""))
-        tracks.append(dict(path=p, original=original, bpm=bpm, key=key))
+        # base: the name the deck shows, without any old "001 - " prefix. For a
+        # tidy folder that's "Artist - Title", otherwise the Mac name.
+        tracks.append(dict(path=p, original=original, base=order.base(p.name), bpm=bpm, key=key))
 
     def name_rank(t):
-        return norm(t["original"])
+        return norm(t["base"])
 
     if by == "bpm":
         tracks.sort(key=lambda t: (t["bpm"] <= 0, t["bpm"], camelot_rank(t["key"]), name_rank(t)))
@@ -115,7 +111,7 @@ def sort_folder(folder: Path, by: str, index, execute: bool) -> None:
         tracks.sort(key=name_rank)
 
     for i, t in enumerate(tracks, 1):
-        t["new"] = t["original"] if by == "name" else f"{i:03d} - {t['original']}"
+        t["new"] = t["base"] if by == "name" else f"{i:03d} - {t['base']}"
 
     unknown = sum(1 for t in tracks if t["bpm"] <= 0 and not t["key"])
     print(f"{folder.name}: {len(tracks)} tracks by {by}"
@@ -138,13 +134,11 @@ def sort_folder(folder: Path, by: str, index, execute: bool) -> None:
         if p.name == ORDER_FILE or p.name.startswith("._"):
             continue
         os.rename(p, work / p.name)
-    if by == "name":
-        (work / ORDER_FILE).unlink(missing_ok=True)
-    else:
-        (work / ORDER_FILE).write_text(json.dumps({
-            "by": by,
-            "original": {t["new"]: t["original"] for t in tracks},
-        }, ensure_ascii=False, indent=1))
+    order.folder = work
+    order.by = None if by == "name" else by
+    order.original = {t["new"]: t["original"] for t in tracks}
+    order.prefixed = set() if by == "name" else {t["new"] for t in tracks}
+    order.save()
     os.rename(folder, old)
     os.rename(work, folder)
     shutil.rmtree(old, ignore_errors=True)

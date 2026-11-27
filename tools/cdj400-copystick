@@ -44,6 +44,8 @@ def main():
 
     plan = []
     for src in sorted(src_root.rglob("*")):
+        if src.parent == src_root and src.name == ".cdj400-lean.json":
+            continue  # names the source stick's restore backup, not the target's
         if src.is_file() and not src.name.startswith("._") and not src.name.endswith(".part"):
             plan.append((src, dst_root / src.relative_to(src_root), src.stat().st_size))
     todo = [(s, d, z) for s, d, z in plan if not (d.is_file() and d.stat().st_size == z)]

@@ -8,8 +8,8 @@ enum StickMode: Sendable {
 
     var label: String {
         switch self {
-        case .lean: "CDJ-400 clean"
-        case .full: "Rekordbox / full mode"
+        case .lean: "Ready for the CDJ-400"
+        case .full: "Rekordbox mode"
         }
     }
 }
@@ -21,6 +21,26 @@ struct Playlist: Identifiable, Hashable, Sendable {
     let tracks: Int
     var trackNames: [String] = []
     var sortedBy: SortOrder?
+    /// Files are named "Artist - Title" from Rekordbox's metadata (cdj400-rename).
+    var tidyNames = false
+    /// Total size of the folder's MP3s.
+    var bytes: Int64 = 0
+}
+
+/// One renamed file, to show what "Artist - Title" names look like on this stick.
+struct NameExample: Hashable, Sendable {
+    let mac: String
+    let shown: String
+}
+
+/// The app's settings, kept in UserDefaults.
+enum AppSettings {
+    /// Make Lean names files "Artist - Title" instead of the Mac file names.
+    static let tidyNamesKey = "tidyNames"
+
+    static var tidyNames: Bool {
+        UserDefaults.standard.object(forKey: tidyNamesKey) as? Bool ?? true
+    }
 }
 
 /// How cdj400-sort ordered a playlist folder.
@@ -58,7 +78,7 @@ enum StickIssue: Hashable, Identifiable, Sendable {
 
     var title: String {
         switch self {
-        case .sidecars(let n): "\(n) ._ sidecar file\(n == 1 ? "" : "s")"
+        case .sidecars(let n): "\(n) hidden macOS file\(n == 1 ? "" : "s")"
         case .unplayable(let n): "\(n) track\(n == 1 ? "" : "s") the CDJ-400 can't play"
         case .nearlyFull: "Almost full"
         case .spotlightIndex: "Spotlight is indexing this stick"
@@ -78,7 +98,7 @@ enum StickIssue: Hashable, Identifiable, Sendable {
     var detail: String {
         switch self {
         case .sidecars:
-            "macOS metadata files that can confuse the deck."
+            "The Mac leaves these “._” files on sticks. They can show up on the deck as broken tracks."
         case .unplayable:
             "Files in Playlists/ that aren't MP3. The CDJ-400 skips them."
         case .nearlyFull:
@@ -105,6 +125,11 @@ struct Stick: Identifiable, Hashable, Sendable {
     var fileSystem = "msdos"
     var unplayable = 0
     var spotlightIndexing = false
+    /// Size of Contents/ on a stick in Rekordbox mode.
+    var exportBytes: Int64 = 0
+    /// When Make Lean made the backup Restore will use (from Playlists/.cdj400-lean.json).
+    var restoreBackupDate: Date?
+    var nameExample: NameExample?
 
     var usedBytes: Int64 { totalBytes - freeBytes }
 
@@ -121,6 +146,15 @@ struct Stick: Identifiable, Hashable, Sendable {
     }
 
     var canGoLean: Bool { mode == .full && tracks > 0 }
+    var canRestore: Bool { mode == .lean }
+    var isNearlyFull: Bool { usedFraction >= 0.9 }
+
+    /// Any playlist folder uses "Artist - Title" names.
+    var hasTidyNames: Bool { playlists.contains(where: \.tidyNames) }
+
+    /// Whether a newly added playlist folder should get tidy names: follow the
+    /// stick's existing folders, or the Make Lean setting on an empty stick.
+    var addsTidyNames: Bool { playlists.isEmpty ? AppSettings.tidyNames : hasTidyNames }
 
     var issues: [StickIssue] {
         var found: [StickIssue] = []
@@ -215,9 +249,9 @@ enum StickAction: String, Identifiable, CaseIterable {
         case .dryRun:
             nil
         case .makeLean:
-            "\(name): rebuilds Playlists/ from the playlists synced to this stick, then deletes PIONEER/ and Contents/ once every file verifies. Make sure Rekordbox is not syncing this stick."
+            "\(name): backs up PIONEER/ to your Mac, rebuilds Playlists/ from the playlists synced to this stick, then deletes PIONEER/ and Contents/ once every file verifies. Make sure Rekordbox is not syncing this stick."
         case .restore:
-            "\(name): returns the stick to Rekordbox mode. Without a backup this means re-syncing it in Rekordbox's Sync Manager."
+            "\(name): moves the tracks back into Rekordbox's Contents/ folder, puts PIONEER/ back from the backup Make Lean made, then removes Playlists/. If there's no backup for this stick, nothing changes and you'll need to re-sync it in Rekordbox's Sync Manager."
         }
     }
 }
